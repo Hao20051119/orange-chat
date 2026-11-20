@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>微信小号控制台</title>
+<style>
+  :root { --bg:#0f1115; --card:#181b22; --line:#252a34; --text:#e8eaed;
+          --dim:#8b93a1; --ok:#3ecf8e; --warn:#f5a524; --bad:#f4525c; --accent:#7c9cff; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+         background:var(--bg); color:var(--text); }
+  .wrap { max-width:960px; margin:0 auto; padding:20px 16px 60px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  h2 { font-size:14px; margin:0 0 10px; color:var(--dim); font-weight:600; }
+  .sub { color:var(--dim); font-size:12px; margin-bottom:18px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px;
+          padding:16px; margin-bottom:14px; }
+  .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+  .row + .row { margin-top:10px; }
+  .k { color:var(--dim); font-size:12px; min-width:64px; }
+  .v { font-variant-numeric:tabular-nums; }
+  .dot { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:6px; }
+  .dot.on { background:var(--ok); box-shadow:0 0 8px var(--ok); }
+  .dot.off { background:var(--bad); }
+  button { background:#232833; color:var(--text); border:1px solid var(--line);
+           border-radius:8px; padding:7px 12px; cursor:pointer; font-size:13px; }
+  button:hover { border-color:var(--accent); }
+  button.primary { background:var(--accent); color:#0b0d11; border-color:var(--accent); font-weight:600; }
+  button.danger { border-color:var(--bad); color:var(--bad); }
+  button.small { padding:4px 9px; font-size:12px; }
+  .switch { display:flex; align-items:center; gap:12px; }
+  .track { width:52px; height:28px; border-radius:14px; background:#2b303b;
+           position:relative; cursor:pointer; transition:.2s; flex:none; }
+  .track.on { background:var(--ok); }
+  .knob { position:absolute; top:3px; left:3px; width:22px; height:22px; border-radius:50%;
+          background:#fff; transition:.2s; }
+  .track.on .knob { left:27px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(110px,1fr)); gap:10px; }
+  .stat { background:#13161c; border-radius:10px; padding:10px 12px; }
+  .stat b { display:block; font-size:20px; font-variant-numeric:tabular-nums; }
+  .stat span { color:var(--dim); font-size:11px; }
+  .msg { padding:8px 0; border-bottom:1px solid var(--line); font-size:13px; }
+  .msg:last-child { border-bottom:none; }
+  .msg .who { color:var(--accent); }
+  .msg .t { color:var(--dim); font-size:11px; float:right; }
+  .msg .st { color:var(--warn); font-size:11px; margin-left:8px; }
+  .draft { border:1px solid var(--line); border-radius:10px; padding:10px 12px; margin-bottom:10px; }
+  .draft .meta { color:var(--dim); font-size:12px; margin-bottom:6px; }
+  .draft .body { white-space:pre-wrap; font-size:14px; margin-bottom:8px; }
+  .draft.hold { border-color:#5a4a1f; }
+  .draft.failed { border-color:#5a2429; }
+  textarea, input[type=text], input[type=password] { width:100%; background:#12151a;
+          color:var(--text); border:1px solid var(--line); border-radius:8px; padding:9px;
+          font:inherit; resize:vertical; }
+  .toast { position:fixed; left:50%; bottom:24px; transform:translateX(-50%);
+           background:#232833; border:1px solid var(--line); padding:10px 18px;
+           border-radius:10px; opacity:0; transition:.25s; pointer-events:none; }
+  .toast.show { opacity:1; bottom:34px; }
+  .tag { display:inline-block; padding:2px 8px; border-radius:6px; background:#232833;
+         font-size:11px; color:var(--dim); margin-right:6px; }
+  .empty { color:var(--dim); font-size:12px; }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>微信小号控制台</h1>
+  <div class="sub">只在本机 127.0.0.1 可访问</div>
+
+  <div class="card" id="authCard">
+    <h2>访问令牌</h2>
+    <div class="row">
+      <input type="password" id="token" placeholder="config.json 里的 token（服务未启用令牌时留空）">
+      <button class="primary" onclick="saveToken()">保存</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <span class="k">账号</span>
+      <span id="nick" class="v">—</span>
+      <span class="tag" id="acc">—</span>
+      <span class="dot off" id="conn"></span><span id="connText" style="font-size:12px;color:var(--dim)">连接中</span>
+    </div>
+    <div class="row">
+      <span class="k">PID</span><span class="v" id="pid">—</span>
+      <span class="k">窗口</span><span class="v" id="hwnd">—</span>
+      <span class="k">已开窗</span><span class="v" id="wins">0</span>
+      <span class="k">记忆</span><span class="v" id="mems">—</span>
+    </div>
+    <div class="row">
+      <span class="k">最近错误</span><span class="v" id="err" style="color:var(--bad)">—</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="switch">
+      <div class="track" id="track"><div class="knob"></div></div>
+      <div>
+        <div style="font-weight:600" id="swLabel">自动回复：载入中</div>
+        <div style="color:var(--dim);font-size:12px">关闭后只收不发，已排队的自动回复会被取消</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>队列</h2>
+    <div class="grid" id="stats"></div>
+  </div>
+
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <h2 style="margin:0">待审回复</h2>
+      <button class="small" onclick="loadDrafts()">刷新</button>
+    </div>
+    <div class="sub" style="margin:6px 0 10px">敏感承诺、被截断、只出草稿的回复都在这里，不会自动发出。</div>
+    <div id="drafts"><div class="empty">加载中…</div></div>
+  </div>
+
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <h2 style="margin:0">暂停中的会话</h2>
+      <button class="small" onclick="loadStats()">刷新</button>
+    </div>
+    <div id="paused"><div class="empty">无</div></div>
+  </div>
+
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <h2 style="margin:0">黑名单</h2>
+      <button class="small" onclick="loadBlacklist()">刷新</button>
+    </div>
+    <div class="sub" style="margin:6px 0 10px">拉黑后不再回复；其余联系人和群默认都会回（群里仍需 @）。填 wxid_xxx 或 数字@chatroom。</div>
+    <div class="row">
+      <input type="text" id="blChat" placeholder="wxid_xxx 或 123@chatroom">
+      <button class="primary" onclick="addBlacklist()">拉黑</button>
+    </div>
+    <div id="blacklist" style="margin-top:8px"><div class="empty">加载中…</div></div>
+  </div>
+
+  <div class="card">
+    <div class="row"><span class="k">最近消息</span>
+      <button class="small" onclick="loadInbox()">刷新</button></div>
+    <div id="inbox" style="margin-top:8px"><div class="empty">加载中…</div></div>
+  </div>
+
+  <div class="card">
+    <h2>手动发消息</h2>
+    <div class="row"><input type="text" id="chat" placeholder="会话（wxid_xxx / 备注名 / 群号）"></div>
+    <div class="row"><textarea id="text" rows="2" placeholder="内容"></textarea></div>
+    <div class="row"><button class="primary" onclick="sendMsg()">发送</button>
+      <span class="tag" id="sendHint"></span></div>
+  </div>
+
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <h2 style="margin:0">用量</h2>
+      <button class="small" onclick="loadUsage()">刷新</button>
+    </div>
+    <div id="usage" class="empty">—</div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let TOKEN = localStorage.getItem("wxtoken") || "";
+
+function saveToken() {
+  TOKEN = document.getElementById("token").value.trim();
+  localStorage.setItem("wxtoken", TOKEN);
+  toast("令牌已保存");
+  refreshAll();
+}
+function headers() {
+  const h = { "Content-Type": "application/json" };
+  if (TOKEN) h["X-Token"] = TOKEN;
+  return h;
+}
+function toast(msg, bad) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.style.borderColor = bad ? "var(--bad)" : "var(--line)";
+  el.classList.add("show");
+  setTimeout(() => el.classList.remove("show"), 2400);
+}
+async function api(path, opt) {
+  const r = await fetch(path, { headers: headers(), ...(opt || {}) });
+  if (r.status === 401) {
+    document.getElementById("authCard").classList.remove("hidden");
+    throw new Error("unauthorized");
+  }
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.json();
+}
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>]/g,
+    c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+}
+
+async function loadStatus() {
+  try {
+    const s = await api("/status");
+    document.getElementById("nick").textContent = s.nick || "—";
+    document.getElementById("acc").textContent = s.account || "—";
+    document.getElementById("pid").textContent = s.bound_pid ?? "—";
+    document.getElementById("hwnd").textContent = s.main_hwnd || "—";
+    document.getElementById("wins").textContent =
+      Object.keys(s.chat_windows || {}).length;
+    document.getElementById("err").textContent = s.last_error || "—";
+    document.getElementById("conn").className = "dot on";
+    document.getElementById("connText").textContent = "服务正常";
+    loadStats();
+  } catch (e) {
+    document.getElementById("conn").className = "dot off";
+    document.getElementById("connText").textContent = "连不上服务";
+  }
+}
+
+async function loadStats() {
+  try {
+    const s = await api("/stats");
+    const q = s.queue || {};
+    const items = [
+      ["待处理", q.inbound_pending], ["重试", q.inbound_retry],
+      ["草稿", q.outbound_draft], ["待审", q.outbound_hold],
+      ["发送中", q.outbound_sending], ["已发", q.outbound_sent],
+      ["失败", q.outbound_failed], ["不确定", q.outbound_uncertain],
+      ["暂停中", (q.paused || []).length],
+    ];
+    document.getElementById("stats").innerHTML = items.map(
+      ([k, v]) => `<div class="stat"><b>${v ?? 0}</b><span>${k}</span></div>`).join("");
+
+    const paused = q.paused || [];
+    document.getElementById("paused").innerHTML = paused.length
+      ? paused.map(c => `<div class="msg"><span class="who">${esc(c)}</span>
+          <button class="small" onclick="resumeChat('${esc(c)}')">解除接管</button></div>`).join("")
+      : '<div class="empty">无</div>';
+
+    document.getElementById("mems").textContent =
+      (s.config && s.config.memory_enabled) ? "长期" : "临时";
+    if (q.recent_failed && q.recent_failed.length && !(s.errors && s.errors.last)) {
+      document.getElementById("err").textContent = q.recent_failed[0].error;
+    }
+  } catch (e) {}
+}
+
+async function loadDrafts() {
+  try {
+    const r = await api("/drafts");
+    const rows = r.drafts || [];
+    window.__drafts = rows;
+    document.getElementById("drafts").innerHTML = rows.length
+      ? rows.map(d => `
+        <div class="draft ${d.status}">
+          <div class="meta">
+            <span class="tag">#${d.id}</span>${esc(d.chat)}
+            <span class="tag">${d.status}${d.gate ? " / " + esc(d.gate) : ""}</span>
+            ${d.error ? "<span class='tag'>" + esc(d.error) + "</span>" : ""}
+            ${d.segments_sent ? "<span class='tag'>已发 " + d.segments_sent + " 段</span>" : ""}
+          </div>
+          <div class="body">${esc(d.text)}</div>
+          <button class="small primary" onclick="draftAct(${d.id},'approve')">批准发送</button>
+          <button class="small" onclick="copyText(${d.id})">复制</button>
+          <button class="small" onclick="draftAct(${d.id},'mark_sent')">标记已发</button>
+          <button class="small danger" onclick="draftAct(${d.id},'reject')">拒绝</button>
+        </div>`).join("")
+      : '<div class="empty">没有待审回复</div>';
+  } catch (e) {
+    document.getElementById("drafts").innerHTML =
+      '<div class="empty">读取失败（检查令牌）</div>';
+  }
+}
+
+function copyText(id) {
+  const row = (window.__drafts || []).find(x => x.id === id);
+  if (!row) return;
+  navigator.clipboard.writeText(row.text).then(
+    () => toast("已复制，可直接到微信里粘贴"), () => toast("复制失败", true));
+}
+
+async function draftAct(id, action) {
+  try {
+    const r = await api("/drafts", { method: "POST", body: JSON.stringify({ id, action }) });
+    const label = { approve: "批准", reject: "拒绝", mark_sent: "标记" }[action] || action;
+    toast(r.ok ? ("已" + label) : ("失败：" + (r.error || "")), !r.ok);
+    loadDrafts(); loadStats();
+  } catch (e) { toast("操作失败", true); }
+}
+
+async function resumeChat(chat) {
+  try {
+    const r = await api("/resume", { method: "POST", body: JSON.stringify({ chat }) });
+    toast(r.ok ? "已解除接管" : ("失败：" + (r.error || "")), !r.ok);
+    loadStats();
+  } catch (e) { toast("操作失败", true); }
+}
+
+async function loadCfg() {
+  try {
+    const c = await api("/config");
+    const on = c.agent && c.agent.auto_reply;
+    document.getElementById("track").className = "track" + (on ? " on" : "");
+    document.getElementById("swLabel").textContent = "自动回复：" + (on ? "已开启" : "已关闭");
+  } catch (e) {}
+}
+
+async function toggle() {
+  try {
+    const c = await api("/config");
+    const on = !(c.agent && c.agent.auto_reply);
+    await api("/config", { method: "POST", body: JSON.stringify({ auto_reply: on }) });
+    document.getElementById("track").className = "track" + (on ? " on" : "");
+    document.getElementById("swLabel").textContent = "自动回复：" + (on ? "已开启" : "已关闭");
+    toast(on ? "已开启自动回复" : "已关闭自动回复");
+    loadStats();
+  } catch (e) { toast("切换失败", true); }
+}
+
+async function loadInbox() {
+  try {
+    const r = await api("/inbox?since=0");
+    const list = (r.messages || []).slice(0, 12);
+    document.getElementById("inbox").innerHTML = list.length
+      ? list.map(m => {
+          const d = new Date((m.ts || 0) * 1000).toLocaleTimeString("zh-CN");
+          const content = (m.content || "").replace(/<[^>]+>/g, " ");
+          return `<div class="msg"><span class="t">${d}</span>
+            <span class="who">${esc(m.chat)}</span> · ${esc(m.type || "文本")}
+            <span class="st">${esc(m.status || "")}</span><br>${esc(content.slice(0, 140))}</div>`;
+        }).join("")
+      : '<div class="empty">暂无消息</div>';
+  } catch (e) {
+    document.getElementById("inbox").innerHTML = '<div class="empty">读取失败</div>';
+  }
+}
+
+async function loadUsage() {
+  try {
+    const u = await api("/usage");
+    const llm = u.llm || {}, web = u.web || {};
+    document.getElementById("usage").textContent =
+      `今天 LLM 调用 ${llm.calls ?? "—"} 次 / ${llm.tokens ?? "—"} tokens · ` +
+      `联网检索 ${web.search ?? "—"} 次 · 抓取 ${web.fetch ?? "—"} 次`;
+  } catch (e) {
+    document.getElementById("usage").textContent = "读取失败";
+  }
+}
+
+async function sendMsg() {
+  const chat = document.getElementById("chat").value.trim();
+  const text = document.getElementById("text").value.trim();
+  if (!chat || !text) return toast("会话和内容都要填", true);
+  document.getElementById("sendHint").textContent = "发送中…";
+  try {
+    const r = await api("/send", { method: "POST", body: JSON.stringify({ chat, text }) });
+    document.getElementById("sendHint").textContent =
+      r.ok ? (r.verified ? "已发送（库内已核验）" : "已发送（未核验）")
+           : ("失败：" + (r.error || r.reason || ""));
+    toast(r.ok ? "已发送" : ("失败：" + (r.error || "")), !r.ok);
+    if (r.ok) document.getElementById("text").value = "";
+  } catch (e) {
+    document.getElementById("sendHint").textContent = "请求失败";
+    toast("发送请求失败", true);
+  }
+}
+
+async function loadBlacklist() {
+  try {
+    const r = await api("/blacklist");
+    const rows = r.blacklist || [];
+    document.getElementById("blacklist").innerHTML = rows.length
+      ? rows.map(c => `<div class="msg"><span class="who">${esc(c)}</span>
+          <button class="small" onclick="removeBlacklist('${esc(c)}')">移出黑名单</button></div>`).join("")
+      : '<div class="empty">黑名单为空（所有人都自动回）</div>';
+  } catch (e) {
+    document.getElementById("blacklist").innerHTML = '<div class="empty">读取失败</div>';
+  }
+}
+
+async function addBlacklist() {
+  const chat = document.getElementById("blChat").value.trim();
+  if (!chat) return toast("填 wxid 或群号", true);
+  try {
+    const r = await api("/blacklist", { method: "POST", body: JSON.stringify({ chat, action: "add" }) });
+    toast(r.ok ? "已拉黑" : ("失败：" + (r.error || "")), !r.ok);
+    if (r.ok) { document.getElementById("blChat").value = ""; loadBlacklist(); }
+  } catch (e) { toast("操作失败", true); }
+}
+
+async function removeBlacklist(chat) {
+  try {
+    const r = await api("/blacklist", { method: "POST", body: JSON.stringify({ chat, action: "remove" }) });
+    toast(r.ok ? "已移出黑名单" : ("失败：" + (r.error || "")), !r.ok);
+    if (r.ok) loadBlacklist();
+  } catch (e) { toast("操作失败", true); }
+}
+
+function refreshAll() {
+  loadStatus(); loadCfg(); loadDrafts(); loadInbox(); loadUsage(); loadBlacklist();
+}
+
+document.getElementById("track").onclick = toggle;
+refreshAll();
+setInterval(() => { loadStats(); loadDrafts(); }, 5000);
+setInterval(loadStatus, 15000);
+</script>
+</body>
+</html>

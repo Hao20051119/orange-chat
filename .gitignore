@@ -1,0 +1,88 @@
+# ============================================================
+# 本仓库可以公开，但下面这些是「本机私有数据」，
+# 绝不能提交（含真实 wxid、聊天记录、密钥、个人人设）
+# ============================================================
+
+# ---- 导出的数据包（含真实人设/记忆，绝不入库）----
+*.zip
+Orange数据-*.zip
+
+# ---- 密钥与本地配置 ----
+config.json
+config.json.tmp
+config.json.bak-*
+keys.json
+api_keys.local.json
+api_keys.local.json.tmp
+python_path.txt
+*.bak-2026*
+*.bak-pacing-*
+
+# ---- 个人数据：真实人设、关系人、说话样本 ----
+persona_card.json
+style_samples.json
+# 模板要保留
+!persona_card.example.json
+!config.example.json
+
+# ---- 运行时数据库（聊天记录、记忆、知识库、提醒）----
+agent/queue.db*
+agent/_test_*.db
+agent/usage.jsonl*
+agent/web_budget.json
+memory/*.db*
+memory/_test_*.db
+tests/_test_*.db
+state/
+
+# ---- 日志与缓存 ----
+reply.log*
+wxbot/inbox.jsonl
+media_cache/
+GUI/.runtime/
+wechatauto_logs/
+backup/
+scratch/
+
+# ---- 表情包素材（用户自己收集的）----
+stickers/resolved/
+stickers/inbox/
+
+# ---- 知识库投喂目录：只留空目录，不收用户资料 ----
+kb/inbox/*
+!kb/inbox/.keep
+
+# ---- 私有依赖库（开源版不需要：依赖走 pip install -r requirements.txt）----
+pylibs/
+
+# ---- 作者私有验收测试（依赖真实人设卡）----
+tools/author_tests/
+
+# ---- 个人笔记 / 开发记录（含真实聊天细节，不公开）----
+改进清单与人设方案.md
+主动聊天与定时提醒-设计方案.md
+主动聊天与定时提醒-最终工程实现方案.md
+知识库工程方案.md
+知识库工程方案-v3-最终版.md
+Orange 固定人设与关系-落地说明.md
+Orange 微信口语理解-落地说明.md
+Orange 微信口语理解改进方案.md
+Orange 私聊回复节奏-落地说明.md
+Orange 私聊回复节奏改进方案.md
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Windows 快捷方式：里面存的是绝对路径，别人电脑上必然失效 ----
+# 需要快捷方式请运行「创建快捷方式.bat」，它按当前位置现算路径
+*.lnk

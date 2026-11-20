@@ -1,0 +1,37 @@
+# -*- coding: utf-8 -*-
+# ===== 运行依赖 =====
+# 一条命令装齐：
+#   python -m pip install -r requirements.txt
+# 国内网络慢，加个镜像：
+#   python -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# ---- 微信客户端自动化（PyPI 包，无需项目内的 pylibs）----
+# [guia] 必须带上：它是 OCR 发送路径的 winsdk + pypinyin；
+# 漏装不会报错，但发消息会一直失败（no_input / enter_failed）。
+wechatauto-replica[guia]>=1.2.10
+
+# ---- 消息与媒体解密 ----
+# 表情包 .gif 解密用（代码里 import Crypto.Cipher.AES）
+pycryptodome>=3.20
+
+# ---- GUI 外观 ----
+# 圆角、渐变、毛玻璃卡片都靠 Pillow 预渲染；缺了自动退回方块样式（功能不受影响）
+pillow>=10.0
+
+# ---- 知识库文件解析 ----
+# 缺哪个只影响对应格式的导入，不影响聊天
+python-docx>=1.1     # .docx
+pypdf>=5.0           # .pdf（文字型）
+openpyxl>=3.1        # .xlsx
+python-pptx>=1.0     # .pptx
+
+# ---- 语音消息处理 ----
+numpy>=1.26          # voice.py 处理音频数组
+
+# ---- 可选：语音消息转文字（config 里 media.voice_asr.enabled=true 才用）----
+# faster-whisper>=1.0
+# pilk>=0.2.4        # 微信 SILK 语音解码
+
+# 说明：以下包由 wechatauto-replica 自动带上，不必单列
+#   uiautomation / pywin32 / psutil / cryptography
+#   winsdk / pypinyin / opencv-python / pyautogui / zstandard / imageio-ffmpeg
