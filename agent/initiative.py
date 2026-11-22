@@ -15,6 +15,7 @@ from __future__ import annotations
 import threading
 import time
 
+import relay
 import reminder
 import proactive
 from logutil import get_logger
@@ -25,10 +26,12 @@ _stop = threading.Event()
 SYNC_EVERY = 30.0          # 提醒发送结果回写间隔（秒）
 CAND_EVERY = 3.0           # 候选判定间隔（秒）
 PRO_EVERY = 15.0           # 主动开口检查间隔（秒）
+BACK_EVERY = 10.0          # 代传话回传汇总间隔（秒）
 TICK = 1.0                 # 到点检查间隔：秒级提醒要靠它
 
 _cand_busy = threading.Event()   # 同一时间只跑一个判定线程，避免并发烧额度
 _pro_busy = threading.Event()
+_back_busy = threading.Event()
 
 
 def stop():
@@ -38,6 +41,15 @@ def stop():
 def tick(q, cfg, now: float | None = None) -> int:
     """跑一轮调度，返回本次排期的提醒条数。测试可直接调。"""
     return len(reminder.fire_due(q, cfg, now=now))
+
+
+def _run_relay_back(q, cfg):
+    try:
+        relay.back_tick(q, cfg)
+    except Exception as e:
+        log.error("代传话回传异常：%s: %s" % (type(e).__name__, e))
+    finally:
+        _back_busy.clear()
 
 
 def _run_candidates(q, cfg):
@@ -63,6 +75,7 @@ def run(q, load_cfg, brain=None):
     last_sync = 0.0
     last_cand = 0.0
     last_pro = 0.0
+    last_back = 0.0
     log.info("主动调度已启动（提醒 tick=%.0fs，回写=%.0fs）" % (TICK, SYNC_EVERY))
     while not _stop.is_set():
         time.sleep(TICK)
@@ -77,6 +90,7 @@ def run(q, load_cfg, brain=None):
                     log.info("提醒结果回写 %d 条" % n)
                 try:
                     q.expire_clarify()
+                    q.expire_relay_clarify()
                     q.expire_hooks()
                 except Exception:
                     pass
@@ -85,6 +99,12 @@ def run(q, load_cfg, brain=None):
                 last_cand = now
                 _cand_busy.set()
                 threading.Thread(target=_run_candidates, args=(q, cfg),
+                                 daemon=True).start()
+            # 代传话回传：够数/超时后组织一句回给发起人
+            if not _back_busy.is_set() and now - last_back > BACK_EVERY:
+                last_back = now
+                _back_busy.set()
+                threading.Thread(target=_run_relay_back, args=(q, cfg),
                                  daemon=True).start()
             # 主动开口同理：生成一句话要几秒，不能卡在 tick 里
             if (brain is not None and not _pro_busy.is_set()

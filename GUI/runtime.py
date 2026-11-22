@@ -28,6 +28,7 @@ if str(ROOT / "agent") not in sys.path:
     sys.path.insert(0, str(ROOT / "agent"))
 import apikeys  # noqa: E402  本机 Key 记录库（api_keys.local.json）
 import runtime_lock  # noqa: E402
+from config import DEFAULT_MODEL, is_deepseek_official, model_id  # noqa: E402
 
 
 class RuntimeError(Exception):
@@ -131,7 +132,7 @@ class OrangeRuntime:
         base_url = configured.get("base_url") or "https://api.deepseek.com"
         return {
             "base_url": base_url,
-            "model": configured.get("model") or "deepseek-chat",
+            "model": model_id(base_url, configured.get("model") or DEFAULT_MODEL),
             # 优先级与配置加载一致：环境变量 > 匹配接口的本机 Key > 旧文件里的 Key
             "api_key": (os.environ.get("DSHWX_API_KEY", "").strip()
                         or apikeys.key_for_url(base_url)
@@ -194,7 +195,7 @@ class OrangeRuntime:
             key = "local"
         if not key or len(key) > 4096 or not key.isascii() or any(c.isspace() for c in key):
             raise RuntimeError("请输入有效的 API Key。")
-        return {"base_url": url, "model": name, "api_key": key}
+        return {"base_url": url, "model": model_id(url, name), "api_key": key}
 
     def test_model(self, selection: dict) -> dict:
         """Only a fixed test prompt goes to the selected provider."""
@@ -203,6 +204,8 @@ class OrangeRuntime:
             payload = {"model": model["model"], "messages": [
                 {"role": "user", "content": "Reply with OK."}], "max_tokens": 128,
                 "stream": False}
+            if model["model"] == DEFAULT_MODEL and is_deepseek_official(model["base_url"]):
+                payload["thinking"] = {"type": "disabled"}
             req = urllib.request.Request(
                 model["base_url"] + "/chat/completions", json.dumps(payload).encode("utf-8"),
                 {"Authorization": "Bearer " + model["api_key"], "Content-Type": "application/json"},
@@ -291,8 +294,11 @@ class OrangeRuntime:
         config.setdefault("agent", {}).update(auto_reply=False, group_member_memory=False)
         config.setdefault("logging", {})["chat_content"] = False
         proactive = config.setdefault("proactive", {})
+        # 主动闲聊每次启动都关（一上来就找人聊天最招人烦）；定时提醒是用户
+        # 显式委托的，保留原开关——每次重连都清零会把已排好的提醒判成
+        # 「提醒功能未开启」直接取消，而且重开也不会补发。
         proactive["enabled"] = False
-        proactive.setdefault("reminders", {})["enabled"] = False
+        proactive.setdefault("reminders", {})
         kb = config.setdefault("kb", {})
         kb.update(inbox=str(folder / "inbox"), db_path=str(folder / "knowledge.db"))
         write_config(path, config)

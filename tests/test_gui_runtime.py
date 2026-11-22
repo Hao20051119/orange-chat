@@ -121,9 +121,10 @@ with patch.multiple(runtime, ROOT=root, STATE=state), \
     stored = json.loads(Path(env["WXBOT_CONFIG"]).read_text(encoding="utf-8"))
     check("预览配置不落密钥", not stored["token"] and not stored["llm"]["api_key"]
           and env["DSHWX_API_KEY"] == profile["api_key"])
-    check("启动默认关闭三个发送开关", not stored["agent"]["auto_reply"]
-          and not stored["proactive"]["enabled"]
-          and not stored["proactive"]["reminders"]["enabled"])
+    check("启动默认关闭自动回复与主动闲聊", not stored["agent"]["auto_reply"]
+          and not stored["proactive"]["enabled"])
+    check("定时提醒开关沿用原配置（重连不丢已排的提醒）",
+          stored["proactive"]["reminders"]["enabled"] is True)
     check("同账号沿用原名单", stored["agent"]["reply_blacklist"] == ["wxid_blocked"])
     check("旧版配置保持原值", runtime.read_config(root / "config.json") == original)
 

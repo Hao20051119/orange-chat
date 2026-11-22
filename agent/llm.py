@@ -15,6 +15,8 @@ import time
 import urllib.error
 import urllib.request
 
+from config import DEFAULT_MODEL, is_deepseek_official, model_id
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(BASE)
 CONFIG = os.environ.get("WXBOT_CONFIG") or os.path.join(ROOT, "config.json")
@@ -99,7 +101,9 @@ def chat(messages, config: dict | None = None, timeout: int = 60,
             return {"ok": False, "fatal": True,
                     "error": "今日 LLM 调用已达上限（%d/%d 次），已停止调用" % (used, budget)}
 
-    url = llm.get("base_url", "https://api.deepseek.com").rstrip("/") + "/chat/completions"
+    base_url = llm.get("base_url") or "https://api.deepseek.com"
+    url = base_url.rstrip("/") + "/chat/completions"
+    model = model_id(base_url, llm.get("model") or DEFAULT_MODEL)
     tokens = int(max_tokens or llm.get("max_tokens", 800))
     token_cap = max(tokens, int(llm.get("max_tokens_cap", 1200)))
     retries = int(llm.get("retries", 2))
@@ -109,12 +113,14 @@ def chat(messages, config: dict | None = None, timeout: int = 60,
     trunc_retried = False
     while attempt <= retries:
         payload = {
-            "model": llm.get("model", "deepseek-chat"),
+            "model": model,
             "messages": messages,
             "temperature": llm.get("temperature", 1.0),
             "max_tokens": tokens,
             "stream": False,
         }
+        if model == DEFAULT_MODEL and is_deepseek_official(base_url):
+            payload["thinking"] = {"type": "disabled"}
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(
             url,

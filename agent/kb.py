@@ -32,6 +32,7 @@ import os
 import re
 import sqlite3
 import sys
+import tempfile
 import time
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -42,7 +43,7 @@ DEFAULT_DB = os.path.join(ROOT, "memory", "knowledge.db")
 DEFAULT_INBOX = os.path.join(ROOT, "kb", "inbox")
 CONFIG = os.environ.get("WXBOT_CONFIG") or os.path.join(ROOT, "config.json")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # 切片
 CHUNK_SIZE = 500          # 目标字数
@@ -132,6 +133,7 @@ CREATE TABLE IF NOT EXISTS kb_documents (
     checked_at    INTEGER,
     expires_at    INTEGER,
     revoked_at    INTEGER,
+    quarantined   INTEGER NOT NULL DEFAULT 0,
     current_revision_id INTEGER,
     UNIQUE(account, scope, chat_id, kind, source_key)
 );
@@ -274,7 +276,20 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         except sqlite3.Error:
             pass
 
-    conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
+    if old_ver < 3:
+        if "quarantined" not in {row[1] for row in conn.execute("PRAGMA table_info(kb_documents)")}:
+            try:
+                conn.execute("ALTER TABLE kb_documents ADD COLUMN quarantined INTEGER NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError:
+                if "quarantined" not in {row[1] for row in conn.execute("PRAGMA table_info(kb_documents)")}:
+                    raise
+        conn.execute(
+            "UPDATE kb_documents SET quarantined=1 WHERE EXISTS ("
+            "SELECT 1 FROM kb_jobs j WHERE j.doc_id=kb_documents.id AND j.account=kb_documents.account "
+            "AND j.state='done' AND j.input_ref LIKE 'wxfile:%')")
+
+    if old_ver < SCHEMA_VERSION:
+        conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
     conn.commit()
     # 外部内容表不存文本，只有新建 / 清洗过才需要重建一次；
     # 早先每次 connect 都 rebuild，库一大就跟入库线程抢写锁。
@@ -601,6 +616,8 @@ def ingest_pages(pages: list[tuple[str, str]], *, source: str = "file",
             if cur and conn.execute(
                     "SELECT 1 FROM kb_revisions WHERE id=? AND content_sha256=?",
                     (cur, digest)).fetchone():
+                conn.execute("UPDATE kb_documents SET quarantined=0 WHERE id=? AND quarantined=1",
+                             (doc_id,))
                 conn.commit()
                 return {"ok": True, "duplicated": True, "doc_id": doc_id, "chunks": 0}
         else:
@@ -625,7 +642,7 @@ def ingest_pages(pages: list[tuple[str, str]], *, source: str = "file",
                     "INSERT INTO kb_chunks(revision_id, ordinal, locator, title, text) "
                     "VALUES(?,?,?,?,?)", (rev_id, ordinals, loc, "", piece))
                 ordinals += 1
-        conn.execute("UPDATE kb_documents SET current_revision_id=?, checked_at=?, "
+        conn.execute("UPDATE kb_documents SET current_revision_id=?, checked_at=?, quarantined=0, "
                      "title=COALESCE(NULLIF(?,''), title), source_ref=COALESCE(NULLIF(?,''), source_ref) "
                      "WHERE id=?", (rev_id, ts, title, origin, doc_id))
         conn.commit()
@@ -654,7 +671,7 @@ def _max_mb() -> int:
 
 def ingest_file(path: str, *, scope: str = "public", chat_id: str = "",
                 ocr: bool = False, title: str = "",
-                account_: str | None = None, conn=None) -> dict:
+                account_: str | None = None, conn=None, origin: str = "") -> dict:
     """解析并入库一个文件。ocr=True 时对图片型文档走云端 OCR。"""
     if not os.path.isfile(path):
         return {"ok": False, "error": "文件不存在：%s" % path}
@@ -688,7 +705,7 @@ def ingest_file(path: str, *, scope: str = "public", chat_id: str = "",
             pages = ocr_remote(path)
             used_ocr = True
 
-    r = ingest_pages(pages, source="file", origin=os.path.abspath(path),
+    r = ingest_pages(pages, source="file", origin=origin or os.path.abspath(path),
                      title=title, scope=scope, chat_id=chat_id,
                      source_key=sha1_file(path), account_=account_, conn=conn)
     r["ocr"] = used_ocr
@@ -758,8 +775,8 @@ def _bigrams(q: str) -> list[str]:
 
 def _scope_clause(chat_id: str) -> tuple[str, tuple]:
     if chat_id:
-        return "(d.scope='public' OR (d.scope='chat' AND d.chat_id=?))", (chat_id,)
-    return "(d.scope='public')", ()
+        return "(d.scope='public' OR (d.scope='chat' AND d.chat_id=?)) AND d.quarantined=0", (chat_id,)
+    return "d.scope='public' AND d.quarantined=0", ()
 
 
 def search(query: str, *, chat_id: str = "", k: int = DEFAULT_TOPK,
@@ -969,23 +986,25 @@ def stats(conn=None) -> dict:
     own = conn is None
     conn = conn or connect()
     try:
-        total = conn.execute(
-            "SELECT count(*) FROM kb_documents WHERE revoked_at IS NULL").fetchone()[0]
+        visible = "revoked_at IS NULL AND quarantined=0"
+        total = conn.execute("SELECT count(*) FROM kb_documents WHERE " + visible).fetchone()[0]
+        quarantined = conn.execute(
+            "SELECT count(*) FROM kb_documents WHERE revoked_at IS NULL AND quarantined=1").fetchone()[0]
         chunks = conn.execute("""
             SELECT count(*) FROM kb_chunks c
             JOIN kb_revisions r ON r.id=c.revision_id
             JOIN kb_documents d ON d.id=r.doc_id AND d.current_revision_id=r.id
-            WHERE d.revoked_at IS NULL""").fetchone()[0]
+            WHERE d.revoked_at IS NULL AND d.quarantined=0""").fetchone()[0]
         by_scope = {r[0]: r[1] for r in conn.execute(
-            "SELECT scope, count(*) FROM kb_documents WHERE revoked_at IS NULL GROUP BY scope")}
+            "SELECT scope, count(*) FROM kb_documents WHERE " + visible + " GROUP BY scope")}
         by_kind = {r[0]: r[1] for r in conn.execute(
-            "SELECT kind, count(*) FROM kb_documents WHERE revoked_at IS NULL GROUP BY kind")}
+            "SELECT kind, count(*) FROM kb_documents WHERE " + visible + " GROUP BY kind")}
         size = 0
         try:
             size = os.path.getsize(db_path())
         except OSError:
             pass
-        return {"documents": total, "chunks": chunks, "by_scope": by_scope,
+        return {"documents": total, "quarantined": quarantined, "chunks": chunks, "by_scope": by_scope,
                 "by_kind": by_kind, "db_bytes": size, "fts": fts_available(),
                 "db_path": db_path()}
     finally:
@@ -1090,17 +1109,18 @@ def owner_wxid() -> str:
     return ""
 
 
-def find_received_file(title: str, msg_ts=0, account_: str | None = None) -> str | None:
-    """在 <账号>\\msg\\file\\<年-月>\\ 里找这条消息对应的文件。
+def find_received_file(title: str, msg_ts=0, account_: str | None = None, *,
+                       file_md5: str = "") -> str | None:
+    """在微信落盘目录查找与消息文件摘要相符的附件。"""
+    if not re.fullmatch(r"[0-9a-f]{32}", file_md5):
+        return None
 
-    只做候选筛选，调用方负责最终校验（realpath 必须在账号目录内）。
-    """
     base = account_dir()
     if not base or not title:
         return None
     safe = title.strip()
     # 微信落盘时会把 Windows 非法字符换掉，这里换成通配符再比对
-    pat = re.sub(r'[\\/:*?"<>|]', "*", safe)
+    pat = "*".join(glob.escape(part) for part in re.split(r'[\\/:*?"<>|]', safe))
     root = os.path.join(base, "msg", "file")
     hits: list[str] = []
     for ym in _months_around(msg_ts):
@@ -1108,21 +1128,24 @@ def find_received_file(title: str, msg_ts=0, account_: str | None = None) -> str
         if not os.path.isdir(d):
             continue
         hits.extend(p for p in glob.glob(os.path.join(d, pat)) if os.path.isfile(p))
-    if not hits:
-        stem = os.path.splitext(safe)[0]
-        for ym in _months_around(msg_ts):
-            d = os.path.join(root, ym)
-            if not os.path.isdir(d):
+        stem, extension = os.path.splitext(safe)
+        numbered = glob.escape(stem) + " (*)" + glob.escape(extension)
+        if not re.search(r'[\\/:*?"<>|]', safe):
+            hits.extend(p for p in glob.glob(os.path.join(d, numbered)) if os.path.isfile(p))
+    max_bytes = _max_mb() * 1024 * 1024
+    for path in dict.fromkeys(hits):
+        if not _safe_path(path):
+            continue
+        try:
+            if os.path.getsize(path) > max_bytes:
                 continue
-            for p in glob.glob(os.path.join(d, "*")):
-                if os.path.isfile(p) and os.path.splitext(os.path.basename(p))[0] == stem:
-                    hits.append(p)
-    if not hits:
-        return None
-    hits = list(dict.fromkeys(hits))
-    target = _ts_sec(msg_ts) or _now()
-    hits.sort(key=lambda p: abs(os.path.getmtime(p) - target))
-    return hits[0]
+            with open(path, "rb") as f:
+                data = f.read(max_bytes + 1)
+            if len(data) <= max_bytes and hashlib.md5(data).hexdigest() == file_md5:
+                return path
+        except OSError:
+            continue
+    return None
 
 
 def _safe_path(path: str) -> bool:
@@ -1151,17 +1174,21 @@ def _stable(path: str, wait: float = 1.0) -> bool:
 
 
 def enqueue_file(event_key: str, chat: str, title: str, ext: str = "",
-                 msg_ts=0, sender: str = "", path: str | None = None) -> dict:
+                 msg_ts=0, sender: str = "", path: str | None = None,
+                 file_md5: str = "") -> dict:
     """登记一条「微信收到的文件」入库任务。幂等，只写一行，不阻塞回复线程。"""
     if not title and not path:
         return {"ok": False, "error": "缺少文件名"}
+    file_md5 = (file_md5 or "").strip().lower()
+    if path is None and not re.fullmatch(r"[0-9a-f]{32}", file_md5):
+        return {"ok": False, "error": "微信消息缺少可核对的文件摘要，可手动导入"}
     acc = account()
     scope, chat_id = "chat", chat or ""
     ow = owner_wxid()
     who = sender or ("" if (chat or "").endswith("@chatroom") else chat)
     if ow and who == ow:
         scope = "public"
-    ref = path or "wxfile:%d|%s" % (_ts_sec(msg_ts), title)
+    ref = path or "wxfile-md5:%d|%s|%s" % (_ts_sec(msg_ts), file_md5, title)
     conn = connect()
     try:
         cur = conn.execute(
@@ -1192,18 +1219,38 @@ def process_jobs(limit: int = 3) -> dict:
             try:
                 ref = job["input_ref"] or ""
                 path = ref
+                expected_md5 = ""
                 if ref.startswith("wxfile:"):
-                    ts_s, title = ref[7:].split("|", 1)
-                    path = find_received_file(title, int(ts_s or 0)) or ""
+                    conn.execute("UPDATE kb_jobs SET state='failed', error_code=? WHERE id=?",
+                                 ("原任务缺少文件摘要，请手动导入", jid))
+                    conn.commit()
+                    failed += 1
+                    continue
+                if ref.startswith("wxfile-md5:"):
+                    ts_s, expected_md5, title = ref.removeprefix("wxfile-md5:").split("|", 2)
+                    path = find_received_file(title, int(ts_s or 0), file_md5=expected_md5) or ""
                 if not path or not os.path.isfile(path):
                     raise KbError("文件还没落地")
                 if not _safe_path(path):
                     raise KbError("文件路径不在账号目录内")
                 if not _stable(path):
                     raise KbError("文件仍在写入")
-                r = ingest_file(path, scope=job["scope"] or "chat",
-                                chat_id=job["chat_id"] or "",
-                                account_=acc, conn=conn)
+                options = {"scope": job["scope"] or "chat", "chat_id": job["chat_id"] or "",
+                           "account_": acc, "conn": conn}
+                if expected_md5:
+                    # 解析已核对的副本，避免微信在校验之后重新覆盖源文件。
+                    limit_bytes = _max_mb() * 1024 * 1024
+                    with open(path, "rb") as f:
+                        data = f.read(limit_bytes + 1)
+                    if len(data) > limit_bytes or hashlib.md5(data).hexdigest() != expected_md5:
+                        raise KbError("附件仍在写入或摘要不匹配")
+                    with tempfile.TemporaryDirectory(prefix="orange_kb_") as tmp:
+                        snapshot = os.path.join(tmp, os.path.basename(path))
+                        with open(snapshot, "wb") as f:
+                            f.write(data)
+                        r = ingest_file(snapshot, **options, origin=path, title=job["title"] or "")
+                else:
+                    r = ingest_file(path, **options)
                 if not r.get("ok"):
                     raise KbError(r.get("error") or "入库失败")
                 conn.execute("UPDATE kb_jobs SET state='done', doc_id=?, error_code=NULL "

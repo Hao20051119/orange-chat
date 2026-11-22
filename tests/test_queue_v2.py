@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """队列 v2：排序、去重、退避重试、出站状态机、崩溃恢复、机器人 intent。"""
+import json
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -101,13 +102,19 @@ partial = approval.create_outbound(ACC, "chatA", "第一段\n第二段",
 approval.bump_segments(partial, 1)
 approval.finish_outbound(partial, "failed", "新机当前读不到会话列表",
                          retryable=0, failure_code="session_list_unavailable")
-check("拒绝更改部分发出的正文",
-      not approval.update_outbound_text(partial, "改写", ACC)
-      and not approval.approve_outbound(partial, ACC, text="改写"))
+check("已发段落的草稿可以改，但只替换剩余部分",
+      approval.update_outbound_text(partial, "改写", ACC))
+row = approval.get_outbound(partial)
+check("保留已发第一段、新正文接在后面",
+      json.loads(row["segments"] or "[]") == ["第一段", "改写"],
+      str(row["segments"]))
+check("批准时不能再带正文覆盖已发段",
+      not approval.approve_outbound(partial, ACC, text="再改一次"))
 check("允许原文只续发未提交的分段", approval.approve_outbound(partial, ACC))
 row = approval.get_outbound(partial)
 check("分段进度不退回，尝试次数重新计算",
-      row["segments_sent"] == 1 and row["segments"] == '["第一段", "第二段"]'
+      row["segments_sent"] == 1
+      and json.loads(row["segments"] or "[]") == ["第一段", "改写"]
       and row["attempts"] == 0)
 
 unsafe = approval.create_outbound(ACC, "chatB", "未经确认")

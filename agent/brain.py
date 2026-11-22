@@ -48,10 +48,11 @@ except Exception:                                    # pragma: no cover
 
 try:
     from media import resolve_for_message, to_data_uri
-    from media import md5_from_content
+    from media import md5_from_content, to_vision_uri
 except Exception:                                    # pragma: no cover
     resolve_for_message = lambda t, c: None
     to_data_uri = lambda p: None
+    to_vision_uri = lambda p, **kw: (None, 0)
     md5_from_content = lambda c: None
 
 # 收尾语：对方准备结束，别追问、别开新话题
@@ -197,39 +198,78 @@ class Brain:
 
     # ------------------------------------------------------------------ 识图
     def describe_media(self, msg_type: str, content: str,
-                       type_code=None) -> str | None:
-        """图片/表情 → 一句描述；同一张图只识别一次（按 md5 缓存）。"""
+                       type_code=None, style: str = "emotion",
+                       image_uri: str | None = None) -> str | None:
+        """图片/表情 → 一句描述；同一张图只识别一次（按 md5 + 用途缓存）。
+
+        ``style`` 决定这次要它看什么：
+
+        * ``emotion``（默认）—— 表情包用：这张图在传达什么情绪，25 字以内
+        * ``content`` —— 图片用：图里有什么、写了什么，最长 ``content_desc_chars``
+
+        图片本身现在会另外直接塞给主模型（``build_messages(images=...)``），
+        这里的描述只负责两件事：当文字占位、以及写进记忆供以后翻。
+        ``image_uri`` 给了就直接用（调用方已经编码过），省一次 PIL 重编码。
+        """
         from msgtype import needs_vision, kind
 
         if not needs_vision(kind(msg_type, type_code)):
             return None
+        vcfg = (self.cfg.get("media") or {}).get("vision")
+        if not isinstance(vcfg, dict):
+            vcfg = {}
+        content_style = (style or "").strip().lower() == "content"
+        if content_style and not vcfg.get("content_desc", True):
+            return None
+        limit = int(vcfg.get("content_desc_chars") or 240) if content_style else 80
+        key = ""
         md5 = md5_from_content(content or "")
         if md5:
-            cached = self.mem.media_desc(md5)
+            # 两种用途各存一份：|c 是「内容」，不带后缀是老的「情绪」
+            key = (md5 + "|c") if content_style else md5
+            cached = self.mem.media_desc(key)
             if cached:
                 return cached
 
-        path = resolve_for_message(msg_type, content or "")
-        if not path:
-            return None
-        uri = to_data_uri(path)
+        uri = image_uri or ""
+        if not uri:
+            path = resolve_for_message(msg_type, content or "")
+            if not path:
+                return None
+            if content_style:
+                # 要读出图里的字（截图/课表/菜单）就得给清晰版本，1024 长边字会糊
+                uri, _size = to_vision_uri(path)
+            else:
+                uri = to_data_uri(path)
         if not uri:
             return None
+        if content_style:
+            ask = ("把这张图里的内容如实说清楚。若是截图，先说这是什么，然后只写对聊天"
+                   "有用的信息：表格、课表、清单逐条列并带上关键数字；图里有文字就抄"
+                   "关键信息。**不要**描述手机状态栏、电量、信号、时间、标题栏这类无关"
+                   "装饰。看不清的地方写「看不清」，不许猜。不要分点符号，用分号连起来，"
+                   "最长 %d 字。" % limit)
+            max_tokens = 500
+        else:
+            ask = ("用不超过 25 个字描述这张图/表情在传达什么情绪，"
+                   "不要分点、不要分析，直接一句话。")
+            max_tokens = 120
         r = llm_chat([
             {"role": "system", "content": "你在帮人看微信聊天里的图片或表情。"},
             {"role": "user", "content": [
-                {"type": "text", "text": "用不超过 25 个字描述这张图/表情在传达什么情绪，"
-                                         "不要分点、不要分析，直接一句话。"},
+                {"type": "text", "text": ask},
                 {"type": "image_url", "image_url": {"url": uri}},
             ]},
-        ], self.cfg, timeout=VISION_TIMEOUT, max_tokens=120)
+        ], self.cfg, timeout=VISION_TIMEOUT, max_tokens=max_tokens)
         if not r.get("ok"):
             log.warning("识图失败：%s" % r.get("error"))
             return None
-        desc = (r.get("text") or "").strip().replace("\n", " ")[:80]
-        if md5 and desc:
+        desc = (r.get("text") or "").strip().replace("\n", " ")
+        if len(desc) > limit:
+            desc = desc[:max(1, limit - 1)] + "…"
+        if key and desc:
             try:
-                self.mem.save_media_desc(md5, desc)
+                self.mem.save_media_desc(key, desc)
             except Exception as e:
                 log.warning("写识图缓存失败：%s" % e)
         return desc or None
@@ -474,12 +514,15 @@ class Brain:
                        sender: str = "", at_me: bool = False,
                        sender_display: str = "",
                        style_text: str | None = None,
-                       reading: str = "") -> list[dict]:
-        """system + 记忆画像/事实 + 历史 + 当前这句话。
+                       reading: str = "",
+                       images: list[dict] | None = None) -> list[dict]:
+        """system + 记忆画像/事实 + 历史 + 当前这句话（+ 这一轮要看的图片）。
 
         ``style_text`` 只影响风格样例检索：主动开口时没有「对方这句话」，
         用钩子/线索当检索文本，风格才贴切。
         ``reading`` 是 ``comprehend()`` 的读法结果，先让模型认下这句话什么意思。
+        ``images`` 是 ``[{"uri": data URI, "cap": "图1（组长刚发的）"}]``：
+        图片直接跟着本轮那句话一起给模型看，不再只靠一句情绪描述转述。
         """
         extra_ctx = ""
         if extra:
@@ -593,14 +636,38 @@ class Brain:
 
         msgs = [{"role": "system", "content": system_full}]
         msgs.extend(kept)
-        msgs.append({"role": "user", "content": current})
+        parts: list[dict] = []
+        if images:
+            # 最后这条 user 换成多模态：先文字，再逐张「标签 + 图」，
+            # 文字里的「图1」「群图2」就是靠这些标签对上的。
+            parts = [{"type": "text", "text": current}]
+            for im in images:
+                uri = (im or {}).get("uri") or ""
+                if not uri:
+                    continue
+                cap = ((im.get("cap") or "").strip()) or "图片"
+                parts.append({"type": "text", "text": "【%s】" % cap})
+                parts.append({"type": "image_url",
+                              "image_url": {"url": uri}})
+        n_img = sum(1 for p in parts if p.get("type") == "image_url")
+        if n_img:
+            msgs.append({"role": "user", "content": parts})
+            log.info("本轮带 %d 张图一起看 [%s]" % (n_img, chat))
+        else:
+            # 一张都没读出来：退回纯文本，别发一个只有字的 parts 列表
+            msgs.append({"role": "user", "content": current})
         return msgs
 
     # ------------------------------------------------------------------ 生成
     def compose(self, chat: str, text: str, extra: str = "",
                 sender: str = "", at_me: bool = False,
-                sender_display: str = "", force_reply: bool = False) -> dict:
-        """构建上下文并调模型，返回 {ok, reply, error, usage}。不写记忆。"""
+                sender_display: str = "", force_reply: bool = False,
+                images: list[dict] | None = None) -> dict:
+        """构建上下文并调模型，返回 {ok, reply, error, usage}。不写记忆。
+
+        ``images`` 见 ``build_messages``：聊天里发来的图真给模型看，不再只给一句
+        情绪描述。
+        """
         if force_reply:
             extra = (extra + "\n【必须回复】对方点名找你了，这次必须回一句，"
                             "不许输出跳过标记。").strip()
@@ -611,8 +678,15 @@ class Brain:
             log.info("读懂：%s" % redact(brief, self.cfg))
         msgs = self.build_messages(chat, text, extra=extra, sender=sender,
                                    at_me=at_me, sender_display=sender_display,
-                                   reading=reading)
+                                   reading=reading, images=images)
         r = llm_chat(msgs, self.cfg)
+        if (images and not r.get("ok") and r.get("status") in (400, 413, 415, 422)
+                and isinstance(msgs[-1]["content"], list)):
+            current = msgs[-1]["content"][0]["text"]
+            msgs[-1] = {"role": "user", "content": current +
+                        "\n\n图片当前无法传给你，请按文字和已有描述回应，看不到的内容不要猜。"}
+            log.info("接口拒绝图片，本轮改用文字回复 [%s]" % chat)
+            r = llm_chat(msgs, self.cfg)
         if not r.get("ok"):
             return {"ok": False, "error": r.get("error")}
         reply = (r.get("text") or "").strip()
@@ -695,6 +769,76 @@ class Brain:
                 reply = rotated
         except Exception as e:
             log.warning("主动开口颜文字轮换失败：%s" % e)
+        return {"ok": True, "reply": reply, "truncated": bool(r.get("truncated"))}
+
+    # -------------------------------------------------------------- 到点提醒
+    def compose_reminder(self, chat: str, content: str, original: str = "",
+                         when_text: str = "", late: bool = False,
+                         timeout: int = 10, relay_from: str = "") -> dict:
+        """到点提醒的措辞：让模型写一句像人说的话。
+
+        与 ``compose_proactive`` 同一套路——只换最后那条指令，人设/关系/记忆/
+        风格照旧。**调用方必须准备模板兜底**：模型超时、空回复、想跳过时，
+        提醒仍要按时发出，准点比措辞重要。
+
+        ``relay_from``：代传话时是谁托的（「联系人A让我提醒你…」）。有值就不能
+        写成自己的主意，得把话交代清楚。
+        """
+        what = (content or "").strip()[:60] or "该做的事"
+        token = self.skip_token(self.cfg)
+        if relay_from:
+            lines = ["【内部任务】%s 托你给他说一声：%s" % (relay_from, what)]
+            lines.append("要发出去给「他」的那句话，1~2 句。")
+        else:
+            lines = ["【内部任务】到点了，你要发一句话提醒他：%s" % what]
+        if when_text:
+            lines.append("现在是%s。" % when_text)
+        if original:
+            said = (original or "").replace("\n", " ")[:120]
+            lines.append("他当时是这么说的：「%s」" % said)
+        lines.extend([
+            "规矩：",
+            "1. 1~2 句，像手机随手打的；别用「%s，XXXX」这种报点格式开头；"
+            % (when_text or "时间"),
+            "2. 别说「已提醒你」「定时任务」「系统」这类词；别复述他那句原话，"
+            "也别把「再/一下/提醒我」这种残句念出来；",
+            "3. 可以带一点被使唤的不情愿或傲娇，但别借机拒绝，也别真骂人；",
+            "4. 别编造你自己的经历，别反问「你自己不看时间吗」；",
+            "5. 直接给这句话本身：不要解释，不要加引号，不要输出 %s。" % token,
+        ])
+        if relay_from:
+            lines.append("6. 要让人一眼看出是%s托你说的，别写成你自己的主意。" % relay_from)
+        if late:
+            lines.append("7. 这条已经晚了一小会儿，可以顺口抱怨一句，但事还是要说。")
+        task = "\n".join(lines)
+        msgs = self.build_messages(
+            chat, text="",
+            extra="【说明】下面这条是内部任务指令，不是你对方说的话；"
+                  "你要做的是到点提醒，而不是回复谁。",
+            style_text=what)
+        msgs[-1] = {"role": "user", "content": task}
+        r = llm_chat(msgs, self.cfg, timeout=max(3, int(timeout or 10)))
+        if not r.get("ok"):
+            return {"ok": False, "error": r.get("error")}
+        reply = (r.get("text") or "").strip()
+        if not reply:
+            return {"ok": False, "error": "模型返回空"}
+        if self.is_skip_text(reply):
+            return {"ok": False, "error": "模型想跳过"}
+        reply = re.sub(r"\s+", " ", reply.replace("\n", " ")).strip()
+        reply = reply.strip("“”\"「」'’")
+        if not reply:
+            return {"ok": False, "error": "模型返回空"}
+        from persona import clean_accent
+        reply = clean_accent(reply)
+        try:
+            from kaomoji import recent_from_mem, rotate
+            rotated, kinfo = rotate(reply, recent=recent_from_mem(self.mem, chat,
+                                                                 limit=8))
+            if kinfo.get("changed"):
+                reply = rotated
+        except Exception as e:
+            log.warning("提醒颜文字轮换失败：%s" % e)
         return {"ok": True, "reply": reply, "truncated": bool(r.get("truncated"))}
 
     # ------------------------------------------------------------------ 拟人

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """知识库：切片、入库幂等、双路检索、权限隔离、撤回、注入预算。"""
+import hashlib
 import os
 import sys
 
@@ -262,15 +263,17 @@ _name = "需求说明.txt"
 _fp = os.path.join(fake, "msg", "file", _ym, _name)
 with open(_fp, "w", encoding="utf-8") as f:
     f.write("这份需求要求实现扫码签到功能，并支持导出 Excel 统计表。")
+with open(_fp, "rb") as f:
+    _md5 = hashlib.md5(f.read()).hexdigest()
 
 orig_acc_dir = kb.account_dir
 orig_account = kb.account
 kb.account_dir = lambda: fake
 kb.account = lambda: ACC
 try:
-    r = kb.enqueue_file("chat1:101", "wxid_alice", _name, "txt", msg_ts=_ts)
+    r = kb.enqueue_file("chat1:101", "wxid_alice", _name, "txt", msg_ts=_ts, file_md5=_md5)
     check("入队成功", r.get("queued") is True, str(r))
-    r2 = kb.enqueue_file("chat1:101", "wxid_alice", _name, "txt", msg_ts=_ts)
+    r2 = kb.enqueue_file("chat1:101", "wxid_alice", _name, "txt", msg_ts=_ts, file_md5=_md5)
     check("同一消息重复入队被忽略", r2.get("queued") is False, str(r2))
 
     pr = kb.process_jobs(limit=5)
@@ -281,27 +284,58 @@ try:
           any(j["state"] == "done" for j in kb.jobs_state(5)),
           str([(j["state"], j["title"]) for j in kb.jobs_state(5)]))
 
-    kb.enqueue_file("chat1:102", "wxid_alice", "还没落地的文件.pdf", "pdf", msg_ts=_ts)
+    kb.enqueue_file("chat1:102", "wxid_alice", "还没落地的文件.pdf", "pdf",
+                    msg_ts=_ts, file_md5=_md5)
+    expected = "新的项目涉及智能储物柜数量统计。".encode()
+    expected_md5 = hashlib.md5(expected).hexdigest()
+    kb.enqueue_file("chat2:104", "wxid_bob", _name, "txt", msg_ts=_ts, file_md5=expected_md5)
     kb.process_jobs(limit=5)
     st = {j["title"]: j for j in kb.jobs_state(10)}
     check("找不到文件时退避重试而不是直接失败",
           (st.get("还没落地的文件.pdf") or {}).get("state") == "pending",
           str(st.get("还没落地的文件.pdf")))
+    check("同名不同摘要的旧文件不会进入另一会话",
+          not kb.search("扫码签到", chat_id="wxid_bob", account_=ACC))
+    check("无摘要的微信附件只允许手动导入",
+          not kb.enqueue_file("chat2:105", "wxid_bob", _name, msg_ts=_ts)["ok"])
+    suffix = os.path.join(os.path.dirname(_fp), "需求说明 (1).txt")
+    with open(suffix, "wb") as f:
+        f.write(expected)
+    with kb.connect() as jobs_conn:
+        jobs_conn.execute("UPDATE kb_jobs SET next_run_at=0 WHERE event_key='chat2:104'")
+    kb.process_jobs(limit=5)
+    check("同名后缀文件按摘要核对后可检索",
+          bool(kb.search("智能储物柜", chat_id="wxid_bob", account_=ACC)))
 
     check("拒绝账号目录外的文件", not kb._safe_path(
         os.path.join(_tf.mkdtemp(), "evil.txt")))
     check("接受账号目录内的文件", kb._safe_path(_fp))
     check("跨月也能找到（试相邻月份）",
-          kb.find_received_file(_name, _ts) == _fp)
+          kb.find_received_file(_name, _ts, file_md5=_md5) == _fp)
 
     # 主人发的文件应当 public
     ow = kb.owner_wxid()
-    r3 = kb.enqueue_file("chat1:103", ACC, _name, "txt", msg_ts=_ts)
+    r3 = kb.enqueue_file("chat1:103", ACC, _name, "txt", msg_ts=_ts, file_md5=_md5)
     job = [j for j in kb.jobs_state(10) if j["event_key"] == "chat1:103"][0]
     check("默认 scope 为 chat（未配置主人时）",
           job["scope"] == ("public" if ow == ACC else "chat"), str(job["scope"]))
 finally:
     kb.account_dir = orig_acc_dir
     kb.account = orig_account
+
+section("旧版未核对摘要的自动入库内容隔离并可手动重新导入")
+old = fresh("old_auto_attach.db")
+doc = kb.ingest_file(_fp, scope="chat", chat_id="wxid_alice", account_=ACC, conn=old)
+old.execute("INSERT INTO kb_jobs(account,event_key,input_ref,state,doc_id) "
+            "VALUES(?,?,?,'done',?)", (ACC, "old", "wxfile:10|需求说明.txt", doc["doc_id"]))
+old.execute("PRAGMA user_version=2")
+old.commit()
+kb.ensure_schema(old)
+check("旧自动入库内容已从会话检索隔离",
+      not kb.search("扫码签到", chat_id="wxid_alice", account_=ACC, conn=old))
+kb.ingest_file(_fp, scope="chat", chat_id="wxid_alice", account_=ACC, conn=old)
+check("手动重新导入恢复已核对内容",
+      bool(kb.search("扫码签到", chat_id="wxid_alice", account_=ACC, conn=old)))
+old.close()
 
 sys.exit(support.finish())

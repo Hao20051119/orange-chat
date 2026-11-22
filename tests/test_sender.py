@@ -116,18 +116,20 @@ def post_unavailable(path, obj, timeout=90):
 
 RW.post = post_unavailable
 retry_id = q_retry.create_outbound(ACC, CHAT, "等待微信界面恢复")
-for attempt in range(1, OUTBOUND_MAX_ATTEMPTS + 1):
+for attempt in range(1, OUTBOUND_MAX_ATTEMPTS + 2):
     q_retry.reset_not_before(retry_id)
     res = w_retry.send_task(q_retry.next_outbound(), sleep_delay=False, reload_cfg=False)
     row = q_retry.get_outbound(retry_id)
-    expected = "draft" if attempt < OUTBOUND_MAX_ATTEMPTS else "failed"
+    expected = "draft" if attempt <= OUTBOUND_MAX_ATTEMPTS else "hold"
     check("第 %d 次尝试记录真实计数和状态" % attempt,
-          row["attempts"] == attempt and row["status"] == res["status"] == expected)
+          row["attempts"] == min(attempt, OUTBOUND_MAX_ATTEMPTS)
+          and row["status"] == res["status"] == expected)
 
-check("达到重试上限后只留待人工处理",
-      row["failure_code"] == "session_list_unavailable" and row["retryable"] == 0
+check("达到重试上限转人工待审（不落 failed，草稿保留）",
+      row["status"] == "hold" and row["failure_code"] == "session_list_unavailable"
+      and row["retryable"] == 0
       and row["attempt_started_ts"] is None and q_retry.next_outbound() is None
-      and len(retry_calls) == OUTBOUND_MAX_ATTEMPTS)
+      and len(retry_calls) == OUTBOUND_MAX_ATTEMPTS + 1)
 check("确认未提交的失败可重新批准", q_retry.approve_outbound(retry_id, ACC)
       and q_retry.get_outbound(retry_id)["attempts"] == 0)
 RW.post = post_ok
@@ -236,8 +238,8 @@ check("人工批准不延长主动消息的绝对截止时间",
 
 section("回读核验")
 w6 = make_worker(support.make_queue("s6.db"))
-w6.db = FakeDB([{"sender_username": "me", "content": "你到家了吗", "create_time": 1000}])
-check("库里有这条 → True", w6._verify_sent(CHAT, "你到家了吗", 995))
+w6.db = FakeDB([{"sender_username": "me", "content": "你到家了吗", "create_time": 1000, "sort_seq": 25}])
+check("库里有这条 → 返回确认序号", w6._verify_sent(CHAT, "你到家了吗", 995) == 25)
 check("时间太早 → False", not w6._verify_sent(CHAT, "你到家了吗", 2000))
 check("内容不同 → False", not w6._verify_sent(CHAT, "别的", 995))
 w6.db = FakeDB([{"sender_username": "对方", "content": "你到家了吗", "create_time": 1000}])

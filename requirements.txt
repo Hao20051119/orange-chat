@@ -14,6 +14,11 @@ wechatauto-replica[guia]>=1.2.10
 # 表情包 .gif 解密用（代码里 import Crypto.Cipher.AES）
 pycryptodome>=3.20
 
+# ---- 时区 ----
+# 跨时区提醒靠 zoneinfo 解析 Europe/London 这类名字；Windows 的 Python 没有
+# 系统时区库，缺它时跨时区提醒会退回固定偏移、夏令时算不准
+tzdata>=2024.1
+
 # ---- GUI 外观 ----
 # 圆角、渐变、毛玻璃卡片都靠 Pillow 预渲染；缺了自动退回方块样式（功能不受影响）
 pillow>=10.0
@@ -31,6 +36,14 @@ numpy>=1.26          # voice.py 处理音频数组
 # ---- 可选：语音消息转文字（config 里 media.voice_asr.enabled=true 才用）----
 # faster-whisper>=1.0
 # pilk>=0.2.4        # 微信 SILK 语音解码
+
+# ---- 可选：ffmpeg（只影响微信 4.x 的 .wxgf 动态表情）----
+# PNG/JPEG/GIF/WEBP 的图片和表情解密后直接可用，不需要 ffmpeg；
+# 只有 .wxgf（H.265 容器）要靠它抽首帧，缺了那类表情会退化成文字占位。
+# 下面这个包会带一个静态 ffmpeg；wechatauto-replica 通常已经替我们装上了，
+# 想显式装就取消注释。装了它、或 ffmpeg 在 PATH 里、或把 ffmpeg.exe 放进
+# tools\ffmpeg\，程序都能自动找到（顺序见 media.find_ffmpeg）。
+# imageio-ffmpeg>=0.5
 
 # 说明：以下包由 wechatauto-replica 自动带上，不必单列
 #   uiautomation / pywin32 / psutil / cryptography

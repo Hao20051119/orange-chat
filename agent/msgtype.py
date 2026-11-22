@@ -39,6 +39,7 @@ _APPMSG_URL = re.compile(r"<url>(.*?)</url>", re.S)
 _APPMSG_DES = re.compile(r"<des>(.*?)</des>", re.S)
 _APPMSG_TYPE = re.compile(r"<appmsg[^>]*>.*?<type>(\d+)</type>", re.S)
 _APPMSG_FILEEXT = re.compile(r"<fileext>([^<]*)</fileext>")
+_APPMSG_FILE_MD5 = re.compile(r"<md5>\s*(?:<!\[CDATA\[)?([0-9a-f]{32})(?:\]\]>)?\s*</md5>", re.I)
 _APPMSG_APPID = re.compile(r'appid="([^"]*)"')
 _REFER_TITLE = re.compile(r"<refermsg>.*?<title>(.*?)</title>", re.S)
 _REFER_CONTENT = re.compile(r"<refermsg>.*?<content>(.*?)</content>", re.S)
@@ -310,7 +311,9 @@ def describe(msg_type, content: str = "", type_code=None, desc: str | None = Non
         m = _APPMSG_FILEEXT.search(c)
         fileext = (m.group(1).strip() if m else "")
         # 真实附件（appmsg type=6）才带元信息，供知识库自动入库时定位磁盘文件
-        attach = {"card_type": atype, "title": title, "ext": fileext} \
+        digest = _APPMSG_FILE_MD5.search(c) if atype == 6 else None
+        attach = {"card_type": atype, "title": title, "ext": fileext,
+                  "file_md5": digest.group(1).lower() if digest else ""} \
             if (atype == 6 or fileext) else {"card_type": atype}
         if atype == 62 or "拍了拍" in title:
             text = "[对方拍了拍你]"

@@ -16,6 +16,9 @@ for key in ("bot", "send", "media", "logging"):
 check("气泡默认开", (d.get("send") or {}).get("bubble") is True)
 check("表情包默认关（未接通）", (d.get("stickers") or {}).get("enabled") is False)
 check("记忆默认开", (d.get("memory") or {}).get("enabled") is True)
+check("默认使用支持图片输入的官方模型", d["llm"]["model"] == "deepseek-flash")
+check("官方地址自动替换停用模型", C.model_id("https://api.deepseek.com", "deepseek-chat") == "deepseek-flash")
+check("兼容接口模型名原样保留", C.model_id("https://example.test/v1", "deepseek-chat") == "deepseek-chat")
 
 check("合法配置无问题", C._validate(d) == [], str(C._validate(d)))
 bad = json.loads(json.dumps(d))

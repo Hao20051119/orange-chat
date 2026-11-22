@@ -4,6 +4,7 @@ import os
 import sqlite3
 import sys
 import time
+from unittest.mock import patch
 
 import support
 from support import check, section
@@ -109,7 +110,8 @@ check("同一个分段仅能领取一次", again["submitted"] is None and len(sv
 section("服务发送复核人工批准时间")
 old_ts = int(time.time()) - 600
 approved_id = q.create_outbound(svc.account, "wxid_a", "人工批准的旧回复")
-q.finish_outbound(approved_id, "failed", "会话列表里没有 '测试联系人'", retryable=0)
+# 「未提交、可重试」的失败才允许人工放行——明确未提交（retryable=1）
+q.finish_outbound(approved_id, "failed", "会话列表里没有 '测试联系人'", retryable=1)
 with q._conn() as conn:
     conn.execute("UPDATE outbound SET created_ts=? WHERE id=?", (old_ts, approved_id))
 approval = svc.draft_action(approved_id, "approve")
@@ -157,5 +159,147 @@ check("允许 [::1]:8765", host_ok("[::1]:8765"))
 check("拦住外部域名（rebinding）", not host_ok("evil.example.com"))
 check("拦住伪装成回环的外部域名", not host_ok("attacker.test:8765"))
 check("无 Host 头（HTTP/1.0 本机工具）放行", host_ok(""))
+
+section("控制台手工每周提醒：星期按联系人当地算")
+import reminder_parse
+from datetime import datetime
+
+q_tz = Queue()
+q_tz.set_chat_tz(svc.account, "wxid_a", 7200)      # 对方比主机快两小时
+mon_23 = int(datetime(2026, 11, 23, 23, 0).timestamp())   # 主机周一 23:00
+rule = wx_service.local_weekday_rule(q_tz, svc.account, "wxid_a", "weekly:1", mon_23)
+check("星期换成联系人当地的周二", rule == "weekly:2", rule)
+nxt = reminder_parse.advance(rule, mon_23, mon_23, 7200)
+check("下一次仍是主机周一 23:00", nxt == mon_23 + 7 * 86400,
+      datetime.fromtimestamp(nxt).strftime("%m-%d %H:%M") if nxt else "None")
+check("不重算就会漂到周日（旧行为对照）",
+      reminder_parse.advance("weekly:1", mon_23, mon_23, 7200) != mon_23 + 7 * 86400)
+check("没时差时不改 rule",
+      wx_service.local_weekday_rule(q_tz, svc.account, "wxid_other", "weekly:1", mon_23)
+      == "weekly:1")
+
+section("控制台提醒列表优先显示可操作的计划")
+for i in range(105):
+    rid = q_tz.add_reminder(svc.account, "wxid_a", f"历史{i}", "single", None)
+    q_tz.update_reminder(rid, status="done")
+active_id = q_tz.add_reminder(svc.account, "wxid_a", "仍有效", "single", mon_23)
+paused_id = q_tz.add_reminder(svc.account, "wxid_a", "可恢复", "single", mon_23)
+q_tz.update_reminder(paused_id, status="paused")
+q_tz.add_reminder("wxid_other", "wxid_a", "另一账号", "single", mon_23)
+wx_service.SERVICE = svc
+handler = object.__new__(wx_service.Handler)
+handler.headers = {"Host": "127.0.0.1"}
+handler._json = lambda result, code=200: (result, code)
+handler.path = "/reminders"
+payload, code = handler.do_GET()
+check("真实 GET 默认列表不被历史挤满", code == 200
+      and [item["id"] for item in payload["items"][:2]] == [active_id, paused_id]
+      and len(payload["items"]) == 100
+      and all(item["account"] == svc.account for item in payload["items"]))
+handler.path = "/reminders?status=done"
+payload, code = handler.do_GET()
+check("显式历史过滤仍生效", code == 200 and len(payload["items"]) == 100
+      and all(item["status"] == "done" for item in payload["items"]))
+
+section("发送回读同时返回实际消息序号")
+
+
+class ReadbackEngine(FakeEngine):
+    def send(self, chat, text, **kwargs):
+        result = super().send(chat, text, **kwargs)
+        if result.get("submitted"):
+            svc.db.messages.insert(0, {"sender_username": svc.me, "content": text, "sort_seq": 31})
+        return result
+
+
+svc.engine = ReadbackEngine()
+svc._verify = wx_service.Service._verify.__get__(svc)
+svc.db.messages = [{"sender_username": svc.me, "content": "真实回读", "sort_seq": 12}]
+result = svc.send("wxid_a", "真实回读")
+check("verified 保持布尔，忽略水位之前的同文消息",
+      result.get("verified") is True and result.get("after_seq") == 12
+      and result.get("verified_seq") == 31, result)
+
+section("核对问句独立发送并保留人工审核")
+import reminder
+
+cfg = support.base_cfg(agent={"auto_reply": False}, proactive={"reminders": {"enabled": True}},
+                       contacts={"wxid_a": {"draft_only": True}})
+wx_service.C.load = lambda **_: cfg
+svc._verify = lambda *_a, **_kw: 45
+svc.engine = FakeEngine()
+base = int(time.time())
+ask = "几点提醒你开会？"
+clarify_id = q_tz.add_clarify(svc.account, "wxid_a", "开会", base, ask)
+prompt_id = reminder.enqueue_clarify_prompt(q_tz, svc.account, "wxid_a")
+q_tz.next_outbound(kinds=("reminder_clarify",), account=svc.account)
+q_tz.begin_outbound_attempt(prompt_id, 0, 0)
+result = svc.send("wxid_a", ask, source="reminder_clarify",
+                  account=svc.account, outbound_id=prompt_id)
+check("联系人只出草稿时不能直接发核对", result["submitted"] is False
+      and result["outbound_status"] == "hold", result)
+q_tz.clear_outbound_attempt(prompt_id)
+q_tz.finish_outbound(prompt_id, "hold", bump_attempt=False)
+check("不允许把人工编辑的核对时间当成真实排程",
+      not svc.draft_action(prompt_id, "approve", "改到八点行吗？")["ok"])
+check("自动回复关闭仍可批准原始核对问句", svc.draft_action(prompt_id, "approve")["ok"])
+q_tz.next_outbound(kinds=("reminder_clarify",), account=svc.account)
+q_tz.begin_outbound_attempt(prompt_id, 0, 0)
+result = svc.send("wxid_a", ask, source="reminder_clarify",
+                  account=svc.account, outbound_id=prompt_id)
+check("批准后通过提醒门禁，并返回核验水位", result.get("verified_seq") == 45, result)
+
+section("代传话核对独立发送与真实回读")
+import relay
+
+ask = "你要我转告测试同学吗？"
+relay_id = q_tz.add_relay_clarify(svc.account, "wxid_a", "你好", ["测试同学"], ask,
+                                  confirm_chat="wxid_other")
+prompt_id = q_tz.enqueue_relay_clarify_prompt(svc.account, "wxid_a", ask)
+with patch.object(relay, "_relations", return_value=[]):
+    check("发起人离开关系网后不再发送核对",
+          bool(relay.clarify_send_block_reason(q_tz, q_tz.get_outbound(prompt_id))))
+relay_relations = patch.object(relay, "_relations",
+                               return_value=[{"name": "发起人", "chat": "wxid_a"}])
+relay_relations.start()
+check("入队不会将问句算成已送达",
+      q_tz.get_relay_clarify(svc.account, "wxid_a")["asks"] == 0)
+q_tz.next_outbound(kinds=("relay_clarify",), account=svc.account)
+q_tz.begin_outbound_attempt(prompt_id, 0, 0)
+result = svc.send("wxid_a", ask, source="relay_clarify",
+                  account=svc.account, outbound_id=prompt_id)
+check("代传话核对尊重联系人草稿开关",
+      result["submitted"] is False and result["outbound_status"] == "hold", result)
+q_tz.clear_outbound_attempt(prompt_id)
+q_tz.finish_outbound(prompt_id, "hold", bump_attempt=False)
+check("代传话核对不能手动改字或标为已发送",
+      not svc.draft_action(prompt_id, "approve", "确定吗？")["ok"]
+      and not svc.draft_action(prompt_id, "mark_sent")["ok"])
+cfg["proactive"]["relay"] = {"enabled": False}
+check("代传功能已关闭时不能批准核对",
+      not svc.draft_action(prompt_id, "approve")["ok"])
+cfg["proactive"]["relay"]["enabled"] = True
+check("关闭普通自动回复仍可批准代传话核对",
+      svc.draft_action(prompt_id, "approve")["ok"])
+q_tz.next_outbound(kinds=("relay_clarify",), account=svc.account)
+q_tz.begin_outbound_attempt(prompt_id, 0, 0)
+result = svc.send("wxid_a", ask, source="relay_clarify",
+                  account=svc.account, outbound_id=prompt_id)
+check("服务对代传话核对返回实际回读序号", result.get("verified_seq") == 45, result)
+q_tz.bump_segments(prompt_id, 1, complete=True, sent_after_seq=result.get("verified_seq"))
+record = q_tz.get_relay_clarify(svc.account, "wxid_a")
+check("核验完成后才有送达证明并累计一次",
+      record["prompt_sent_ts"] and record["prompt_verified_seq"] == 45
+      and record["asks"] == 1 and record["confirm_chat"] == "wxid_other", record)
+check("换一轮确认会清除旧问句的核验依据",
+      q_tz.advance_relay_clarify(relay_id, [], "你要我转给谁？")
+      and q_tz.get_relay_clarify(svc.account, "wxid_a")["prompt_sent_ts"] is None
+      and q_tz.get_relay_clarify(svc.account, "wxid_a")["asks"] == 1)
+old_prompt_id = q_tz.enqueue_relay_clarify_prompt(svc.account, "wxid_a", "你要我转给谁？")
+q_tz.add_relay_clarify(svc.account, "wxid_a", "改为这条", [], "要转达给谁？")
+check("新委托撤回上一条还未发送的核对",
+      q_tz.get_outbound(old_prompt_id)["status"] == "cancelled"
+      and q_tz.get_relay_clarify_by_id(relay_id)["status"] == "cancelled")
+relay_relations.stop()
 
 sys.exit(support.finish())

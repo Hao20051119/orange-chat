@@ -103,6 +103,9 @@ def base_cfg(**over) -> dict:
                 "timeout": 8, "deadline_ms": 8000, "daily_budget": 200},
         "contacts": {},
         "logging": {"keep_days": 14, "max_mb": 5, "chat_content": False},
+        # 代传话追问/回执的「人设改写」要真调模型：测试默认关掉，别打真接口。
+        # 要测这条链路的用例自己把 polish 打开并 patch llm.chat。
+        "proactive": {"relay": {"polish": False}},
     }
     for k, v in (over or {}).items():
         if isinstance(v, dict) and isinstance(cfg.get(k), dict):

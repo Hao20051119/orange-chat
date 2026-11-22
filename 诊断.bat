@@ -30,4 +30,11 @@ if exist reply.log (
     echo 还没有 reply.log
 )
 echo.
+echo ==== 7. 表情解析用的 ffmpeg ====
+if defined PY (
+    "%PY%" -c "import sys; sys.path.insert(0,'agent'); import media; print('ffmpeg:', media.ffmpeg_exe() or '(未找到：.wxgf 表情会跳过，装法见 README)')"
+) else (
+    echo 先装 Python 再看这一项
+)
+echo.
 pause

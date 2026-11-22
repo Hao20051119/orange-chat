@@ -46,11 +46,13 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import site
 import sqlite3
 import sys
+import tempfile
 import time
 import zipfile
 from datetime import datetime
@@ -62,14 +64,15 @@ BACKUP = ROOT / "backup"
 
 # 带 account 列、需要跟着账号改的表
 ACCOUNT_TABLES = {
-    "queue.db": ("inbound", "outbound", "collect_watermark", "reminders",
-                 "reminder_actions", "reminder_candidates", "proactive_state"),
+    "queue.db": ("inbound", "outbound", "reminders", "reminder_actions",
+                 "reminder_candidates", "reminder_clarify", "relay_clarify",
+                 "relay_watch", "chat_tz", "proactive_state", "hooks"),
     "knowledge.db": ("kb_documents", "kb_jobs"),
 }
 # 会话里的三个数据文件
 DB_FILES = ("queue.db", "memory.db", "knowledge.db")
 
-# 会话目录里必须跟着走的文件；其余（日志/锁/缓存）不迁。
+# 会话目录里必须跟着走的文件；另单独迁移未完成事项引用的图片。
 # web_budget.json 是"今天已用多少"的计数，跨机器带过去会平白吃掉预算，故意不带。
 SESSION_FILES = ("config.json", "queue.db", "memory.db", "knowledge.db", "usage.jsonl")
 # keys.json 是本机微信的媒体解密密钥，换机器后失效（工具会自己重新探测），故不迁
@@ -82,8 +85,15 @@ CODE_FILES = (
     "agent/*.py", "memory/*.py", "stickers/*.py", "tests/*.py",
     "tools/*.py", "tools/*.bat", "tools/*.ps1", "wxbot/*.py", "wxbot/*.bat", "wxbot/*.html",
     "GUI/*.py", "GUI/*.bat", "GUI/README.md", "GUI/orange-icon.png", "GUI/orange.ico",
-    "kb/README.md", "kb/inbox/.keep",
+    "kb/README.md", "kb/inbox/.keep", "docs/*.md", "docs/screenshots/*.png",
 )
+PENDING_MEDIA = (
+    ("reminder_candidates", "images", "status='pending'"),
+    ("reminder_clarify", "images", "status IN ('pending','asked')"),
+    ("relay_watch", "reply_text", "status IN ('waiting','collecting')"),
+)
+MEDIA_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+MEDIA_DIGEST = re.compile(r"[a-f0-9]{32}", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------- 基础工具
@@ -180,6 +190,83 @@ def clone_db(src: Path, dst: Path):
         target.close()
 
 
+def cached_media(entry: dict, caches: tuple[Path, ...]) -> tuple[Path | None, str]:
+    """只接受位于本次迁移的媒体缓存中的文件。"""
+    digest = str(entry.get("m") or "").lower()
+    digest = digest if MEDIA_DIGEST.fullmatch(digest) else ""
+    raw = str(entry.get("p") or "")
+    if raw:
+        path = Path(raw)
+        if MEDIA_DIGEST.fullmatch(path.stem):
+            digest = digest or path.stem.lower()
+        try:
+            resolved = path.resolve()
+            if (resolved.suffix.lower() in MEDIA_SUFFIXES
+                    and any(resolved.is_relative_to(cache) for cache in caches)
+                    and resolved.is_file() and resolved.stat().st_size):
+                if not digest:
+                    with resolved.open("rb") as stream:
+                        digest = hashlib.file_digest(stream, "md5").hexdigest()
+                return resolved, digest
+        except (OSError, ValueError):
+            pass
+    if digest:
+        for cache in caches:
+            for suffix in MEDIA_SUFFIXES:
+                path = cache / (digest + suffix)
+                if not path.is_symlink() and path.is_file() and path.stat().st_size:
+                    return path, digest
+    return None, digest
+
+
+def transfer_pending_media(db_path: Path, sources: tuple[Path, ...], target: Path, *, account: str):
+    """只复制在途引用的图片，并用媒体缓存键代替旧电脑的绝对路径。"""
+    if not account or not db_path.is_file():
+        return
+    caches = tuple(cache.resolve() for cache in sources if cache.is_dir())
+    target = target.resolve()
+    conn = sqlite3.connect(db_path, timeout=25)
+    try:
+        with conn:
+            for table, column, pending in PENDING_MEDIA:
+                columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+                if column not in columns:
+                    continue
+                rows = conn.execute(
+                    f"SELECT id,{column} FROM {table} WHERE {pending} AND {column}<>'' AND account=?",
+                    (account,),
+                ).fetchall()
+                for id_, raw in rows:
+                    try:
+                        entries = json.loads(raw)
+                    except (TypeError, ValueError):
+                        continue
+                    if not isinstance(entries, list):
+                        continue
+                    for index, entry in enumerate(entries):
+                        if (not isinstance(entry, dict)
+                                or (table == "relay_watch" and entry.get("k") != "image")):
+                            continue
+                        path, digest = cached_media(entry, caches)
+                        if path is not None:
+                            dest = target / (digest + path.suffix.lower())
+                            if path != dest:
+                                target.mkdir(parents=True, exist_ok=True)
+                                shutil.copy2(path, dest)
+                        entry.pop("p", None)
+                        entry.pop("local_id", None)
+                        entry.pop("shard", None)
+                        if digest:
+                            entry["m"] = digest
+                        elif table == "relay_watch":
+                            label = "表情包" if entry.get("l") == "表情包" else "图片"
+                            entries[index] = f"[对方发来一张{label}]"
+                    conn.execute(f"UPDATE {table} SET {column}=? WHERE id=?",
+                                 (json.dumps(entries, ensure_ascii=False), id_))
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------- status
 def cmd_status(_args) -> int:
     session = find_session()
@@ -248,8 +335,8 @@ def cmd_export(args) -> int:
     # 默认落在项目根、文件名带日期：用户一眼能找到，也不容易覆盖上一份
     out = Path(args.out) if args.out else ROOT / ("Orange数据-%s.zip" % stamp())
     out.parent.mkdir(parents=True, exist_ok=True)
-    staging = BACKUP / ("migrate-%s-tmp" % stamp())
-    staging.mkdir(parents=True, exist_ok=True)
+    BACKUP.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix="migrate-", dir=BACKUP))
 
     manifest = {
         "kind": "orange-migrate",
@@ -280,6 +367,9 @@ def cmd_export(args) -> int:
                 clone_db(src, data / "runtime" / name)
             else:
                 shutil.copy2(src, data / "runtime" / name)
+        transfer_pending_media(data / "runtime" / "queue.db",
+                               (session / "media_cache", ROOT / "media_cache"),
+                               data / "runtime" / "media_cache", account=account)
 
         # 会话里的投喂目录（知识库放进来但还没处理/需要留档的文件）
         inbox = session / "inbox"
@@ -312,10 +402,17 @@ def cmd_export(args) -> int:
         write_json(staging / "manifest.json", manifest)
 
         print("打包 %s ..." % out)
-        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
-            for path in sorted(staging.rglob("*")):
-                if path.is_file():
-                    zf.write(path, path.relative_to(staging))
+        with tempfile.NamedTemporaryFile(dir=out.parent, prefix=".orange-export-",
+                                         suffix=".tmp", delete=False) as file:
+            staged_zip = Path(file.name)
+        try:
+            with zipfile.ZipFile(staged_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+                for path in sorted(staging.rglob("*")):
+                    if path.is_file():
+                        zf.write(path, path.relative_to(staging))
+            staged_zip.replace(out)
+        finally:
+            staged_zip.unlink(missing_ok=True)
         size = out.stat().st_size / 1024 / 1024
         print("完成：%s（%.1f MB）" % (out, size))
         print("旧 account：%s  →  import 时会自动换成本机的新 account" % account)
@@ -334,6 +431,8 @@ def cmd_export(args) -> int:
 # ---------------------------------------------------------------- adapt 核心
 def update_accounts(path: Path, old: str, new: str) -> list[str]:
     """把库里所有 account 列从旧值改成新值，返回改过的表。"""
+    if not old:
+        return ["缺少源账号标识，保留数据库里的账号及水位"]
     touched = []
     conn = sqlite3.connect(str(path), timeout=25)
     try:
@@ -341,24 +440,53 @@ def update_accounts(path: Path, old: str, new: str) -> list[str]:
             "SELECT name FROM sqlite_master WHERE type='table'")]
         wanted = ACCOUNT_TABLES.get(path.name, ())
         with conn:
-            for table in tables:
-                if table not in wanted:
-                    continue
-                cols = [r[1] for r in conn.execute("PRAGMA table_info([%s])" % table)]
-                if "account" not in cols:
-                    continue
-                changed = conn.execute(
-                    "UPDATE [%s] SET account=? WHERE account<>?" % table,
-                    (new, new)).rowcount
-                if changed:
-                    touched.append("%s %d 行" % (table, changed))
             # 采集水位是微信本机库的 sort_seq，换机器后数值体系变了，必须清空，
             # 否则要么漏采（水位偏高）要么把旧历史翻出来重发。清空后 worker 会
             # 按"本次启动之后到达的消息"重新起水位。
-            if path.name == "queue.db":
-                removed = conn.execute("DELETE FROM collect_watermark").rowcount
+            if path.name == "queue.db" and "collect_watermark" in tables:
+                removed = conn.execute("DELETE FROM collect_watermark WHERE account=?", (old,)).rowcount
                 if removed:
                     touched.append("collect_watermark 清空 %d 行" % removed)
+            if path.name == "queue.db" and "inbound" in tables:
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(inbound)")}
+                if "sort_seq" in columns:
+                    cleared = conn.execute(
+                        "UPDATE inbound SET sort_seq=NULL WHERE account=? AND sort_seq IS NOT NULL", (old,)
+                    ).rowcount
+                    if cleared:
+                        touched.append("inbound 清除旧机的 sort_seq %d 行（消息保留）" % cleared)
+            if path.name == "queue.db" and "outbound" in tables:
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(outbound)")}
+                if "verified_seq" in columns:
+                    conn.execute("UPDATE outbound SET verified_seq=NULL WHERE account=? "
+                                 "AND verified_seq IS NOT NULL", (old,))
+                if {"attempt_dispatched", "attempt_after_seq", "retryable"} <= columns:
+                    changed = conn.execute(
+                        "UPDATE outbound SET status='unverified', retryable=0, attempt_after_seq=NULL, "
+                        "error='迁移前已提交，请在微信核对该段' "
+                        "WHERE account=? AND status IN ('sending','uncertain') AND attempt_dispatched=1",
+                        (old,),
+                    ).rowcount
+                    if changed:
+                        touched.append("outbound %d 条已提交任务等待人工核对" % changed)
+            if path.name == "queue.db" and "relay_watch" in tables:
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(relay_watch)")}
+                if "reply_after_seq" in columns:
+                    cleared = conn.execute(
+                        "UPDATE relay_watch SET reply_after_seq=0 WHERE account=? AND reply_after_seq<>0",
+                        (old,),
+                    ).rowcount
+                    if cleared:
+                        touched.append("relay_watch 清除旧机回传水位 %d 行" % cleared)
+            if old != new:
+                for table in wanted:
+                    cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+                    if "account" not in cols:
+                        continue
+                    changed = conn.execute(f"UPDATE {table} SET account=? WHERE account=?",
+                                           (new, old)).rowcount
+                    if changed:
+                        touched.append("%s %d 行" % (table, changed))
     finally:
         conn.close()
     return touched
@@ -397,6 +525,9 @@ def adapt_session(old_folder: Path, account: str, apply: bool) -> dict:
                 report["tables"].extend(
                     "%s: %s" % (name, item) for item in
                     update_accounts(path, old_account, account))
+        transfer_pending_media(target / "queue.db",
+                               (target / "media_cache", ROOT / "media_cache"),
+                               target / "media_cache", account=account)
         write_json(target / "config.json", fix_config(old_cfg, account, target))
         (target / "inbox").mkdir(exist_ok=True)
         return report
@@ -440,6 +571,9 @@ def adapt_session(old_folder: Path, account: str, apply: bool) -> dict:
             report["tables"].extend(
                 "%s: %s" % (name, item)
                 for item in update_accounts(path, old_account, account))
+    transfer_pending_media(target / "queue.db",
+                           (old_folder / "media_cache", ROOT / "media_cache"),
+                           target / "media_cache", account=account)
 
     write_json(target / "config.json", fix_config(old_cfg, account, target))
     report["old_kept"] = old_folder
@@ -525,8 +659,8 @@ def cmd_import(args) -> int:
     selected = pick_account(args)
     account, wxid = selected["account"], selected["wxid"]
 
-    staging = BACKUP / ("import-%s" % stamp())
-    staging.mkdir(parents=True, exist_ok=True)
+    BACKUP.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix="import-", dir=BACKUP))
     try:
         with zipfile.ZipFile(src) as zf:
             zf.extractall(staging)
@@ -543,6 +677,8 @@ def cmd_import(args) -> int:
         print("旧 account：%s  →  新 account：%s" % (manifest.get("account"), account))
         print("目标目录：%s" % target)
         data = staging / "data"
+        if not (data / "runtime" / "queue.db").is_file():
+            raise SystemExit("迁移包缺少 queue.db，无法导入。")
 
         if not args.apply:
             for name in DB_FILES:
@@ -553,28 +689,42 @@ def cmd_import(args) -> int:
             print("\n[预演] 加 --apply 才会写入。")
             return 0
 
-        backup = BACKUP / ("%s-pre-import-%s" % (stamp(), target.name))
-        if target.exists() and any(target.iterdir()):
-            shutil.copytree(target, backup)
-            print("目标目录已有数据，已备份到：%s" % backup)
-            shutil.rmtree(target)
-        target.mkdir(parents=True, exist_ok=True)
-        (target / "inbox").mkdir(exist_ok=True)
-
+        pending = staging / "prepared-session"
+        pending.mkdir()
+        (pending / "inbox").mkdir()
         session_config = fix_config(without_credentials(read_json(data / "runtime" / "config.json")),
                                     account, target)
         for name in SESSION_FILES:
             item = data / "runtime" / name
             if name != "config.json" and item.is_file():
-                shutil.copy2(item, target / name)
+                shutil.copy2(item, pending / name)
         inbox = data / "runtime" / "inbox"
         if inbox.is_dir():
-            for item in inbox.iterdir():
-                dest = target / "inbox" / item.name
-                if item.is_dir():
-                    shutil.copytree(item, dest, dirs_exist_ok=True)
-                else:
-                    shutil.copy2(item, dest)
+            shutil.copytree(inbox, pending / "inbox", dirs_exist_ok=True)
+
+        old_account = str(manifest.get("account") or "")
+        touched = []
+        for name in ACCOUNT_TABLES:
+            path = pending / name
+            if path.is_file():
+                touched.extend("%s: %s" % (name, x)
+                               for x in update_accounts(path, old_account, account))
+        transfer_pending_media(pending / "queue.db", (data / "runtime" / "media_cache",),
+                               pending / "media_cache", account=account)
+        write_json(pending / "config.json", session_config)
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        backup = None
+        if target.exists():
+            backup = BACKUP / ("%s-pre-import-%s-%s" % (stamp(), target.name, staging.name))
+            target.rename(backup)
+            print("目标目录已有数据，已备份到：%s" % backup)
+        try:
+            pending.rename(target)
+        except OSError:
+            if backup is not None:
+                backup.rename(target)
+            raise
 
         # 项目级文件：配置、人设卡、风格样本
         for name in PROJECT_FILES:
@@ -602,15 +752,6 @@ def cmd_import(args) -> int:
             item = data / name
             if item.is_dir():
                 shutil.copytree(item, ROOT / name, dirs_exist_ok=True)
-
-        old_account = str(manifest.get("account") or "")
-        touched = []
-        for name in ACCOUNT_TABLES:
-            path = target / name
-            if path.is_file():
-                touched.extend("%s: %s" % (name, x)
-                               for x in update_accounts(path, old_account, account))
-        write_json(target / "config.json", session_config)
 
         print("已写入：%s" % target)
         for item in touched:

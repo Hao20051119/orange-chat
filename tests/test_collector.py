@@ -38,7 +38,8 @@ def msg(content, sender=CHAT, mtype="文本", ts=None, local_id=1, seq=10):
 
 section("对方消息 → 入队")
 w = make_worker()
-w._on_msg(msg("在吗", sender=CHAT, local_id=101, seq=11))
+first_msg = msg("在吗", sender=CHAT, local_id=101, seq=11)
+w._on_msg(first_msg)
 groups = w.q.pending_by_chat()
 check("入队成功", len(groups.get(CHAT, [])) == 1, str(groups))
 row = groups[CHAT][0]
@@ -49,7 +50,8 @@ check("不写记忆（等批次处理时写）", w.brain.mem.count(CHAT) == 0,
       str(w.brain.mem.count(CHAT)))
 
 section("同一会话不重复入队")
-w._on_msg(msg("在吗", sender=CHAT, local_id=101, seq=11))
+# 用同一条消息重复投递：msg() 每次用当前秒，跨秒会变成两条不同消息（flake）
+w._on_msg(dict(first_msg))
 check("重复消息被去重", len(w.q.pending_by_chat().get(CHAT, [])) == 1)
 
 section("机器人自己发的 → 不触发接管")

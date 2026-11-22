@@ -45,8 +45,10 @@ if os.path.isdir(PYLIB) and PYLIB not in sys.path:
 import gate as gate_mod                                 # noqa: E402
 import groupchat                                        # noqa: E402
 import initiative                                       # noqa: E402
+import media                                            # noqa: E402
 import msgtype                                          # noqa: E402
 import proactive as proactive_mod                       # noqa: E402
+import relay as relay_mod                               # noqa: E402
 import reminder as reminder_mod                         # noqa: E402
 import runtime_lock                                     # noqa: E402
 from brain import Brain                                 # noqa: E402
@@ -55,6 +57,15 @@ from wx_identity import open_bound_db                   # noqa: E402
 from wxqueue import OUTBOUND_MAX_ATTEMPTS, Queue        # noqa: E402
 
 DRY = "--dry" in sys.argv
+
+# 图片相关默认值：配置里缺键时用它，避免老配置把「看图」整个关掉
+_VISION_DEFAULTS = {
+    "show_images": True,
+    "max_images_per_turn": 4,
+    "max_bytes": 6 * 1024 * 1024,
+    "content_desc": True,
+    "content_desc_chars": 240,
+}
 
 _stop = threading.Event()
 
@@ -271,6 +282,20 @@ class Worker:
         # 采集健康度：每个状态周期汇总一次（长期为 0 就是采集器没在扫）
         self._scan_stats = {"rounds": 0, "sessions": 0, "enqueued": 0}
 
+        log.info("启动 账号=%s 昵称=%s dry=%s" % (self.acc, info.get("nick_name"), DRY))
+        log.info("白名单=%s 群聊=%s 记忆=%s" % (
+            self.brain.agent.get("reply_whitelist"),
+            self.brain.agent.get("group_reply"),
+            "长期" if getattr(self.brain.mem, "persistent", True) else "临时"))
+
+        n = self.q.recover_inflight(age=0, account=self.acc)
+        if n:
+            log.warning("恢复中断任务 %d 条 → uncertain（先核验不重发）" % n)
+        stale = self.q.clear_locks()
+        if stale:
+            log.warning("清理上次进程残留的会话锁 %d 个" % stale)
+        self.q.prune_robot_sent(days=7)
+
     def _scan_tick(self, field: str = "", n: int = 1) -> dict:
         """更新/取采集健康度计数；懒建立，兼容只 new 出实例的测试与旧对象。"""
         stats = getattr(self, "_scan_stats", None)
@@ -279,24 +304,6 @@ class Worker:
         if field:
             stats[field] = stats.get(field, 0) + n
         return stats
-
-        log.info("启动 账号=%s 昵称=%s dry=%s" % (self.acc, info.get("nick_name"), DRY))
-        log.info("白名单=%s 群聊=%s 记忆=%s" % (
-            self.brain.agent.get("reply_whitelist"),
-            self.brain.agent.get("group_reply"),
-            "长期" if getattr(self.brain.mem, "persistent", True) else "临时"))
-
-        n = self.q.recover_inflight(age=180, account=self.acc)
-        if n:
-            log.warning("恢复中断任务 %d 条 → uncertain（先核验不重发）" % n)
-        stale = self.q.clear_locks()
-        if stale:
-            log.warning("清理上次进程残留的会话锁 %d 个" % stale)
-        if not (self.cfg.get("takeover") or {}).get("enabled", False):
-            n = self.q.clear_pauses()
-            if n:
-                log.warning("人工接管已关闭，解除历史暂停 %d 条" % n)
-        self.q.prune_robot_sent(days=7)
 
     def _check_bound_cfg(self, cfg: dict):
         pinned = os.environ.get("WXBOT_ACCOUNT") or self.acc
@@ -474,13 +481,16 @@ class Worker:
             return
         try:
             import kb
-            key = "%s:%s" % (m.get("chat"), m.get("local_id") or m.get("sort_seq"))
+            key = "inbound:%s" % m["id"]
             r = kb.enqueue_file(
                 event_key=key, chat=m.get("chat") or "",
                 title=info.get("title") or "", ext=info.get("ext") or "",
-                msg_ts=m.get("msg_ts"), sender=m.get("sender") or "")
+                msg_ts=m.get("msg_ts"), sender=m.get("sender") or "",
+                file_md5=info.get("file_md5") or "")
             if r.get("queued"):
                 log.info("kb 收到文件待入库：%s" % (info.get("title") or "")[:60])
+            elif not r.get("ok"):
+                log.info("kb 附件未自动入库：%s" % r.get("error"))
         except Exception as e:
             log.warning("kb 入队失败：%s: %s" % (type(e).__name__, e))
 
@@ -568,29 +578,113 @@ class Worker:
                 "对方在你发出去之前又补了话，把两轮并成**一条**最终回复："
                 "只回一次、别分成两条，也别重复已经说过的内容。" % texts[0][:80])
 
-    def _absorb(self, msgs: list[dict]) -> tuple[str, list[tuple[dict, str]]]:
-        """把一批消息变成 (合并文本, [(消息, 单条文本)])，图片/表情最多识图 2 张。"""
+    def _vision_cfg(self) -> dict:
+        """图片相关开关：默认把图真给模型看（图里常常带信息）。
+
+        ``config._merge_defaults`` 只做浅合并，老配置里的 ``media`` 段会整体覆盖
+        默认值，所以这里再兜一遍默认值，别让缺键把图片功能关掉。
+        """
+        raw = (self.cfg.get("media") or {}).get("vision")
+        out = dict(_VISION_DEFAULTS)
+        if isinstance(raw, dict):
+            out.update({k: v for k, v in raw.items() if v is not None})
+        return out
+
+    def _resolve_media(self, m: dict, kind: str):
+        return media.resolve_for_message(
+            kind, m.get("content") or "", chat=m.get("chat") or "",
+            local_id=m.get("local_id"), shard=m.get("shard"), account=self.acc)
+
+    def _image_for_model(self, m: dict, remaining_bytes: int | None,
+                         want_desc: bool = True) -> tuple[str, int, str | None]:
+        """一条图片消息 → (data URI, 字节数, 内容描述)。
+
+        ``remaining_bytes`` 是这一轮还剩多少 base64 预算；``None`` 表示不限。
+        读不出来（没解密、缺 ffmpeg、坏图）就都返空，调用方退回文字占位。
+        """
+        content = m.get("content") or ""
+        uri, size = "", 0
+        try:
+            path = self._resolve_media(m, "image")
+        except Exception as e:
+            log.warning("解图失败：%s" % e)
+            path = None
+        if path:
+            try:
+                uri, size = media.to_vision_uri(path)
+            except Exception as e:
+                log.warning("图片转 data URI 失败：%s" % e)
+                uri, size = "", 0
+        desc = None
+        if want_desc and uri:
+            try:
+                # 图已经编码好了就顺手传进去，省一次 PIL 重编码
+                desc = self.brain.describe_media(
+                    m.get("msg_type") or "", content, m.get("type_code"),
+                    style="content", image_uri=uri or None)
+            except Exception as e:
+                log.warning("图片内容描述失败：%s" % e)
+        if uri and remaining_bytes is not None and size > remaining_bytes:
+            uri, size = "", 0
+        return uri, size, desc
+
+    def _vision_used(self, images) -> int:
+        return sum(len(im["uri"]) - im["uri"].index(",") - 1 for im in images)
+
+    def _absorb(self, msgs: list[dict], prior_images=()) -> tuple[str, list[tuple[dict, str]], list[dict]]:
+        """把一批消息变成 (合并文本, [(消息, 单条文本)], [(图片 uri, 标签)])。
+
+        * **图片**：能解密就随本轮一起真给模型看——聊天里的图常常带着信息
+          （课表、菜单、截图），只给一句「在传达什么情绪」等于什么都没说。
+          同时让模型写一句内容描述，既当文字占位，也写进记忆供以后翻。
+        * **表情包**：仍然只要一句情绪描述，不塞图（省钱，也不容易猜错）。
+        * **语音**：转写（可用时）。
+        """
         pairs: list[tuple[dict, str]] = []
-        media_done = 0
+        images: list[dict] = []
+        emoji_done = 0
+        img_desc_extra = 0
+        vcfg = self._vision_cfg()
+        max_imgs = int(vcfg.get("max_images_per_turn", 4) or 0)
+        budget = int(vcfg.get("max_bytes", 6 * 1024 * 1024) or 0)
+        used = self._vision_used(prior_images)
+        describe_images = vcfg.get("content_desc", True)
         for m in msgs:
             k = msgtype.kind(m.get("msg_type"), m.get("type_code"))
+            text = ""
+            desc = None
             if k == "text":
                 text = m.get("content") or ""
-            else:
-                desc = None
-                if k == "voice":
-                    try:
-                        import voice
-                        desc = voice.transcribe(m["chat"], m.get("local_id"),
-                                               m.get("shard"))
-                    except Exception as e:
-                        log.warning("语音转写失败：%s" % e)
-                elif msgtype.needs_vision(k) and media_done < 2:
+            elif k == "voice":
+                try:
+                    import voice
+                    desc = voice.transcribe(m["chat"], m.get("local_id"),
+                                           m.get("shard"))
+                except Exception as e:
+                    log.warning("语音转写失败：%s" % e)
+            elif k == "image":
+                image_count = len(prior_images) + len(images)
+                attach = (vcfg.get("show_images", True) and image_count < max_imgs
+                          and used < budget)
+                if attach or (describe_images and img_desc_extra < 2):
+                    uri, size, desc = self._image_for_model(
+                        m, budget - used if attach else 0, want_desc=describe_images)
+                    if uri and attach:
+                        cap = "图%d" % (image_count + 1)
+                        images.append({"uri": uri, "cap": cap})
+                        used += size
+                        text = ("[对方发来一张图片（就在下面的「%s」里%s）]"
+                                % (cap, ("：" + desc) if desc else ""))
+                    else:
+                        img_desc_extra += 1
+            elif msgtype.needs_vision(k):
+                if emoji_done < 2:
                     desc = self.brain.describe_media(
                         m.get("msg_type") or "", m.get("content") or "",
                         m.get("type_code"))
                     if desc:
-                        media_done += 1
+                        emoji_done += 1
+            if not text:
                 info = msgtype.describe(m.get("msg_type") or "",
                                         m.get("content") or "",
                                         m.get("type_code"), desc=desc)
@@ -599,7 +693,98 @@ class Worker:
                     self._kb_enqueue(m, info)
             if text:
                 pairs.append((m, text))
-        return "\n".join(t for _, t in pairs).strip(), pairs
+        return ("\n".join(t for _, t in pairs).strip(), pairs, images)
+
+    def _group_context(self, chat: str, exclude_ids=(), prior_images=()) -> tuple[str, list[dict]]:
+        """群里「没人 @ 我」的那几句也带上，让模型知道刚才在聊什么。
+
+        只读入站表：不写记忆、不改状态、不触发回复。图片会在这一轮真给模型
+        看（标成「群图N」），否则别人刚发的图在模型眼里只剩一个占位符。
+        """
+        gc = (self.cfg.get("agent") or {}).get("group_context")
+        if not isinstance(gc, dict):
+            gc = {}
+        limit = int(gc.get("window", 10) or 0)
+        if limit <= 0 or not (chat or "").endswith("@chatroom"):
+            return "", []
+        minutes = int(gc.get("minutes", 30) or 0)
+        try:
+            rows = self.q.recent_inbound(
+                chat, limit=limit, account=self.acc, exclude_ids=exclude_ids,
+                within_seconds=int(minutes * 60) if minutes > 0 else 0)
+        except Exception as e:                  # 读失败就这一轮不带背景，照常回
+            log.warning("群背景读取失败：%s: %s" % (type(e).__name__, e))
+            return "", []
+        if not rows:
+            return "", []
+
+        vcfg = self._vision_cfg()
+        max_imgs = int(vcfg.get("max_images_per_turn", 4) or 0) - len(prior_images)
+        budget = int(vcfg.get("max_bytes", 6 * 1024 * 1024) or 0)
+        max_chars = int(gc.get("chars", 700) or 0)
+        used = self._vision_used(prior_images)
+        chars = 0
+        # 从最新的往回装：装不下就先丢最老的，别把刚发生的那句挤掉
+        entries: list[tuple[str, object]] = []
+        names: dict[str, str] = {}
+        for r in reversed(rows):
+            if max_chars > 0 and chars >= max_chars:
+                break                       # 背景只当背景，别把它堆成正文
+            sender = r.get("sender") or ""
+            who = ""
+            if sender:
+                if sender not in names:
+                    try:
+                        names[sender] = self.directory.display(chat, sender)
+                    except Exception:
+                        names[sender] = ""
+                who = names[sender]
+            k = msgtype.kind(r.get("msg_type"), r.get("type_code"))
+            body = ""
+            if (k == "image" and vcfg.get("show_images", True)
+                    and used < budget
+                    and sum(1 for t, _ in entries if t == "image") < max_imgs):
+                uri, size, _ = self._image_for_model(
+                    r, budget - used,
+                    want_desc=False)
+                if uri:
+                    used += size
+                    entries.append(("image", {"uri": uri, "who": who}))
+                    chars += 12             # 图片占位行大约这么长
+                    continue
+            if k != "text":
+                try:
+                    body = msgtype.describe(r.get("msg_type"),
+                                            r.get("content") or "",
+                                            r.get("type_code"))["text"]
+                except Exception:
+                    body = "[%s]" % k
+            else:
+                body = (r.get("content") or "").strip()
+            if not body:
+                continue
+            line = ("%s：%s" % (who, body)) if who else body
+            entries.append(("line", line))
+            chars += len(line)
+        entries.reverse()
+
+        images: list[dict] = []
+        lines: list[str] = []
+        for kind_, val in entries:
+            if kind_ != "image":
+                lines.append(str(val))
+                continue
+            n = len(images) + 1
+            who = (val or {}).get("who") or ""
+            images.append({"uri": val["uri"],
+                           "cap": "群图%d%s" % (
+                               n, ("（%s 刚发的）" % who) if who else "")})
+            lines.append("%s[群图%d]" % ((who + "：") if who else "", n))
+        if not lines:
+            return "", images
+        text = ("【群里刚才说了什么（背景，不是让你一条条去回；标了群图N的图片"
+                "就在下面）】\n" + "\n".join(lines))
+        return text, images
 
     def _record_user(self, pairs: list[tuple[dict, str]]):
         """逐条写入入站记忆（``in:{id}`` 幂等，重生成/重启不重复）。
@@ -622,6 +807,56 @@ class Worker:
                                    src_key="in:%s" % m["id"], sender=sender)
             except Exception as e:
                 log.warning("写入入站记忆失败：%s" % e)
+
+    def _note_relay_replies(self, watch: dict, msgs: list[dict]):
+        """把 B 这批消息记进代传话回传：文字存原文，图片/表情存本地路径。
+
+        以前一律折算成一句文字描述，图就变成「[对方发来一张图片]」，封口时
+        模型只能回「他发了张图，没正面回你」。这里把图落成路径（不存 base64，
+        免得 queue.db 疯长），封口时再一次性喂给模型自己看。
+        """
+        for _m in msgs:
+            kind = msgtype.kind(_m.get("msg_type"), _m.get("type_code"))
+            content = _m.get("content") or ""
+            ts = int(_m.get("msg_ts") or time.time())
+            if not self.q.relay_reply_is_new(watch.get("asked_ts") or 0,
+                                             watch.get("reply_after_seq"),
+                                             ts, _m.get("sort_seq")):
+                continue
+            identity = {"message_id": _m.get("id"), "sort_seq": _m.get("sort_seq")}
+            if kind in ("image", "emoji"):
+                path = ""
+                try:
+                    path = self._resolve_media(_m, kind) or ""
+                except Exception as e:
+                    log.warning("回传解图失败 [%s]：%s" % (watch.get("target_chat"), e))
+                md5 = media.md5_from_content(content) or ""
+                local_id = _m.get("local_id") if kind == "image" else None
+                if path or md5 or local_id:
+                    self.q.add_relay_media(
+                        watch["id"], path=path, md5=md5, ts=ts,
+                        label="表情包" if kind == "emoji" else "图片",
+                        local_id=local_id, shard=_m.get("shard"), **identity)
+                    continue
+            text_m = content
+            if kind != "text":
+                try:
+                    text_m = msgtype.describe(_m.get("msg_type"), content,
+                                              _m.get("type_code"))["text"]
+                except Exception:
+                    text_m = "[%s]" % kind
+            self.q.add_relay_reply(watch["id"], text_m, ts, **identity)
+
+    def _capture_relay_batch(self, chat: str, msgs: list[dict] | None = None):
+        """收集回读确认前就已经入队的快速回复，写入按入站 ID 去重。"""
+        try:
+            watch = self.q.relay_watch_for(self.acc, chat)
+            if watch:
+                if msgs is None:
+                    msgs = self.q.recent_inbound(chat, limit=30, account=self.acc, within_seconds=120)
+                self._note_relay_replies(watch, msgs)
+        except Exception as e:
+            log.warning("回传补收失败 [%s]：%s" % (chat, e))
 
     def process(self, chat: str):
         if not self.q.acquire_chat(chat, ttl=300):
@@ -666,21 +901,54 @@ class Worker:
                     at_me = True
                     self.q.mark_at(chat, target)
 
+            # 提醒委托和代传话先过一遍：它们有自己的开关（proactive.reminders
+            # + 黑名单），不该被「自动回复关着」一起挡掉——关自动回复只是不聊天，
+            # 用户显式委托的提醒还得记下来，否则只开定时提醒的人一条也收不到。
+            relayed = []
+            captured = []
+            prompts = []
+            if not is_group and gate_mod.reminder_entry_ok(self.cfg, chat)[0]:
+                # 代传话回传：他可能正在回答「你替 A 问的那件事」
+                self._capture_relay_batch(chat, msgs)
+                # 时区线索可能出现在普通聊天里（「我在英国」「我这边比国内晚八小时」），
+                # 不只在提醒委托那一句——先扫一遍记下来，之后所有提醒都按他当地算。
+                for _m in msgs:
+                    try:
+                        reminder_mod.note_tz_hint(
+                            self.cfg, self.q, chat, _m.get("content") or "",
+                            int(_m.get("msg_ts") or time.time()), self.acc)
+                    except Exception as e:
+                        log.warning("时区线索扫描失败 [%s]：%s" % (chat, e))
+                # 代传话：「你主动提醒一下他该睡觉了」——跨会话的委托，先兑现，
+                # 记了动作以后提醒扫描就不会把同一句再当成自己的提醒。
+                try:
+                    relayed = relay_mod.maybe_relay(self.cfg, self.q, chat, msgs,
+                                                    self.acc)
+                except Exception as e:
+                    log.warning("代传话处理失败 [%s]：%s: %s"
+                                % (chat, type(e).__name__, e))
+                # 委托扫描也处理不需要生成回复的消息，如「20 秒后提醒我喝水」。
+                captured = self._capture_reminders(chat, msgs, prompt_outbounds=prompts)
+
             allowed, why = gate_mod.identity_ok(self.cfg, chat, at_me=at_me)
+            if (prompts or relayed) and not captured and all(it.get("pending") for it in relayed):
+                if allowed:
+                    _, pairs, _ = self._absorb(msgs)
+                    self._record_user(pairs)
+                self.q.mark_inbounds([m["id"] for m in msgs], "done")
+                return
             if not allowed:
                 self.q.mark_inbounds([m["id"] for m in msgs], "skipped")
                 log.info("跳过 [%s]: %s" % (chat, why))
                 return
 
-            # 委托扫描也处理不需要生成回复的消息，如「20 秒后提醒我喝水」。
-            self._capture_reminders(chat, msgs)
             if not is_group:
                 proactive_mod.note_ending(self.q, self.acc, chat, msgs[-1].get("content") or "")
                 self._maybe_hooks(chat, msgs)
                 if self._absorb_into_draft(chat, msgs) or self._absorb_silently(chat, msgs):
                     return
 
-            combined, pairs = self._absorb(msgs)
+            combined, pairs, images = self._absorb(msgs)
             if not combined:
                 self.q.mark_inbounds([m["id"] for m in msgs], "skipped")
                 return
@@ -731,21 +999,43 @@ class Worker:
             while True:
                 extra = "\n\n".join(x for x in (avoid_dup, media_hint, merge_hint,
                                                 multi_hint) if x)
+                # 群里没点名的最近几句也当背景带上（含图片）
+                turn_images = list(images)
+                if is_group:
+                    window, win_images = self._group_context(chat, processed, prior_images=images)
+                    if window:
+                        extra = (window + "\n\n" + extra).strip()
+                    if win_images:
+                        turn_images.extend(win_images)
+                # 这一轮刚建了提醒：告诉模型「你已经记下了」，否则它会嘴上否认
+                try:
+                    acc_hint = reminder_mod.accepted_hint(self.q, captured,
+                                                          self.acc, chat)
+                    if acc_hint:
+                        extra = (extra + "\n\n" + acc_hint).strip()
+                    rl_hint = relay_mod.hint_line([it for it in relayed if not it.get("pending")])
+                    if rl_hint:
+                        extra = (extra + "\n\n" + rl_hint).strip()
+                except Exception as e:
+                    log.warning("提醒已记下提示注入失败：%s" % e)
                 if analysis:
                     extra = (extra + "\n\n【对话关系判断（按这个理解再回）】\n"
                              + analysis).strip()
-                # 有待澄清的钟点（「明天提醒我体检」但没说几点）：顺口问一句
-                try:
-                    hint = reminder_mod.clarify_hint(self.q, chat, account=self.acc)
-                    if hint:
-                        extra = (extra + "\n\n" + hint).strip()
-                except Exception as e:
-                    log.warning("澄清提示注入失败：%s" % e)
-                comp = self.brain.compose(chat, combined,
-                                          extra=extra,
-                                          sender=sender_wxid,
-                                          at_me=at_me,
-                                          sender_display=sender_display)
+                refusal = relay_mod.refusal_reply(relayed)
+                if refusal:
+                    # 回执是程序写的（发没发、谁被排除），发之前换成橙子的口吻；
+                    # 事实缺一条就退回原句，见 relay.polish_receipt
+                    refusal = relay_mod.polish_receipt(
+                        self.cfg, refusal,
+                        names=[it.get("name") for it in relayed if it.get("name")])
+                    comp = {"ok": True, "reply": refusal}
+                else:
+                    comp = self.brain.compose(chat, combined,
+                                              extra=extra,
+                                              sender=sender_wxid,
+                                              at_me=at_me,
+                                              sender_display=sender_display,
+                                              images=turn_images)
                 if not comp.get("ok"):
                     log.error("生成失败 [%s]: %s" % (chat, comp.get("error")))
                     self._record_user(pairs)       # 失败了也要记住对方说了什么
@@ -760,7 +1050,7 @@ class Worker:
                         comp = self.brain.compose(
                             chat, combined, extra=extra, sender=sender_wxid,
                             at_me=at_me, sender_display=sender_display,
-                            force_reply=True)
+                            force_reply=True, images=turn_images)
                         if (not comp.get("ok")) or comp.get("skip"):
                             reply = random.choice(self.FORCED_REPLIES)
                             log.warning("被@但模型仍想跳过，用兜底回复 [%s]" % chat)
@@ -781,11 +1071,29 @@ class Worker:
                              if (m.get("sender") or "") == sender_wxid]
                 if merge_cfg.get("invalidate_on_new", True) and newer and regen < max_regen:
                     regen += 1
-                    self._capture_reminders(chat, newer)
-                    add_text, add_pairs = self._absorb(newer)
+                    # 合并期间新到的「帮我提醒小王」也得走代传话，否则会被
+                    # 当成发起人自己的普通提醒，目标那边什么都收不到。
+                    # 顺序和主流程一致：先代传话（它会把消息记成已处理），
+                    # 再扫普通提醒。
+                    if not is_group and gate_mod.reminder_entry_ok(self.cfg, chat)[0]:
+                        self._capture_relay_batch(chat, newer)
+                        try:
+                            relayed += relay_mod.maybe_relay(self.cfg, self.q, chat,
+                                                             newer, self.acc)
+                        except Exception as e:
+                            log.warning("补充消息代传话失败 [%s]：%s: %s"
+                                        % (chat, type(e).__name__, e))
+                        captured += self._capture_reminders(chat, newer, prompt_outbounds=prompts)
+                    add_text, add_pairs, add_images = self._absorb(newer, prior_images=images)
+                    if (prompts or relayed) and not captured and all(it.get("pending") for it in relayed):
+                        self._record_user(pairs + add_pairs)
+                        self.q.mark_inbounds(processed + [m["id"] for m in newer], "done")
+                        return
                     if add_text:
                         combined = (combined + "\n" + add_text).strip()
                         pairs.extend(add_pairs)
+                        if add_images:
+                            images.extend(add_images)
                         processed.extend(m["id"] for m in newer)
                         if is_group:
                             at_me = at_me or any(
@@ -851,11 +1159,42 @@ class Worker:
             finally:
                 self._release(chat)
 
-    def _capture_reminders(self, chat: str, messages: list[dict]):
+    def _batch_image_refs(self, messages: list[dict], limit: int = 3) -> list[dict]:
+        """这一批里的图片 → ``[{"p":路径,"m":md5,"l":"图片"}]``（只解路径，不调模型）。
+
+        提醒判定要用：课表、日程、海报里的时间只有图上才有。
+        """
+        refs: list[dict] = []
+        for m in messages or []:
+            if len(refs) >= limit:
+                break
+            if msgtype.kind(m.get("msg_type"), m.get("type_code")) != "image":
+                continue
+            content = m.get("content") or ""
+            path = ""
+            try:
+                path = self._resolve_media(m, "image") or ""
+            except Exception as e:
+                log.warning("提醒解图失败：%s" % e)
+            md5 = media.md5_from_content(content) or ""
+            if path or md5 or m.get("local_id"):
+                refs.append({"p": path, "m": md5, "l": "图片", "chat": m.get("chat"),
+                             "local_id": m.get("local_id"), "shard": m.get("shard")})
+        return refs
+
+    def _capture_reminders(self, chat: str, messages: list[dict], *, prompt_outbounds=None) -> list:
+        """扫一轮委托，返回新建的提醒 id（给回复侧说一句「我记下了」用）。
+
+        图片一起送进去：粗筛命中之后，「以后每次化学前沿课前十分钟」这种话
+        只有看图才知道那门课是周几几点。
+        """
         try:
-            reminder_mod.maybe_capture(self.cfg, self.q, chat, messages, self.acc)
+            return reminder_mod.maybe_capture(
+                self.cfg, self.q, chat, messages, self.acc,
+                images=self._batch_image_refs(messages), prompt_outbounds=prompt_outbounds) or []
         except Exception as e:
             log.warning("提醒扫描失败 [%s]：%s: %s" % (chat, type(e).__name__, e))
+            return []
 
     def run_processor(self):
         last_expire = 0.0
@@ -929,7 +1268,8 @@ class Worker:
         except Exception as e:
             log.warning("话题提取已暂停 [%s]：%s" % (chat, e))
 
-    def _verify_sent(self, chat: str, text: str, t0: float, after_seq: int | None = None) -> bool:
+    def _verify_sent(self, chat: str, text: str, t0: float,
+                     after_seq: int | None = None) -> int | None:
         """回读微信库确认自己真的发出了（比"输入框已清空"可靠）。"""
         try:
             for m in self.db.get_messages(chat, limit=30):
@@ -944,13 +1284,14 @@ class Worker:
                     expected = (text or "").strip()
                 if content.strip() != expected:
                     continue
-                if after_seq is not None and int(m.get("sort_seq") or 0) <= after_seq:
+                seq = int(m.get("sort_seq") or 0)
+                if not seq or (after_seq is not None and seq <= after_seq):
                     continue
                 if int(m.get("create_time") or 0) >= int(t0):
-                    return True
+                    return seq
         except Exception as e:
             log.warning("回读核验失败：%s" % e)
-        return False
+        return None
 
     def _presend_supplement(self, task: dict, chat: str) -> str:
         """首段提交前的复检：这条草稿还没发出去，对方有没有又补话。
@@ -977,6 +1318,8 @@ class Worker:
         if not newer:
             return ""
         if absorbable_supplement(newer):
+            if gate_mod.reminder_entry_ok(self.cfg, chat)[0]:
+                self._capture_relay_batch(chat, newer)
             self._note_absorbed(newer)
             self.q.mark_inbounds([m["id"] for m in newer], "done")
             log.info("发送前把 %d 条补充并进这条回复（只是语气）#%d [%s]"
@@ -1006,7 +1349,7 @@ class Worker:
                             if row.get("attempt_started_ts") is not None:
                                 self.q.mark_uncertain(task["id"], str(e))
                             else:
-                                self.q.requeue_outbound(task["id"], note=str(e))
+                                self._retry_unsubmitted(row, str(e), 0)
                     except Exception:
                         pass
                 log.error("发送循环异常：%s: %s" % (type(e).__name__, e))
@@ -1019,6 +1362,10 @@ class Worker:
         kind = task.get("kind") or "reply"
         if kind == "reminder":
             reason = reminder_mod.send_block_reason(self.q, self.cfg, task)
+        elif kind == "reminder_clarify":
+            reason = reminder_mod.clarify_send_block_reason(self.q, task)
+        elif kind == "relay_clarify":
+            reason = relay_mod.clarify_send_block_reason(self.q, task)
         elif kind == "proactive":
             reason = proactive_mod.send_block_reason(self.q, self.cfg, task)
         else:
@@ -1040,9 +1387,56 @@ class Worker:
         elif status == "expired" and task.get("kind") == "reminder":
             self.q.mark_missed(task["id"], reason)
         else:
-            self.q.finish_outbound(task["id"], status, reason, bump_attempt=False)
+            self.q.finish_outbound(task["id"], status, reason, bump_attempt=False,
+                                   expected="sending")
         log.info("出站 #%d [%s] %s：%s" % (task["id"], task["chat"], status, reason))
         return {"status": status, "reason": reason}
+
+    # ------------------------------------------------------------ 未提交的软重试
+    # 「未提交」= 微信那边一个字符都没发出去，重试绝不会重复。以前的出路是
+    # 「重试 3 次 → failed」，可一次身份误判就进失败列表；现在：
+    # * 等环境恢复的（托盘/全屏）不计次数、一直等，用户一打开就能发；
+    # * 其余未提交失败按 attempts 计数，到 OUTBOUND_MAX_ATTEMPTS 转 hold
+    #   （待人工，草稿保留、可批准），不再落 failed。
+    # 只有「重试也不会好」的才直接转人工。
+    NOT_COUNTED = ("main_in_tray", "fullscreen")
+    PERMANENT = ("bad_args", "account_mismatch", "identity_mismatch", "input_busy")
+
+    def _retry_unsubmitted(self, task: dict, reason: str, index: int,
+                           code: str = "") -> dict:
+        used = int(task.get("attempts") or 0)
+        send_cfg = self.cfg.get("send") or {}
+        if code in self.PERMANENT:
+            note = "发送未提交（%s），重试无用，已转人工待审" % (code or reason)
+            if not self.q.finish_outbound(task["id"], "hold", note, bump_attempt=False,
+                                          retryable=0, failure_code=code or None,
+                                          expected="sending"):
+                log.info("任务已被撤回或结案，不再转待审核 #%d" % task["id"])
+                return {"status": "blocked", "reason": "任务已撤回或结案", "segment": index}
+            log.warning("发送未提交 #%d [%s]：%s" % (task["id"], task["chat"], note))
+            return {"status": "hold", "reason": note, "segment": index}
+        counted = code not in self.NOT_COUNTED
+        if counted and used >= OUTBOUND_MAX_ATTEMPTS:
+            note = ("连续 %d 次未提交（最后原因：%s），已转人工待审，草稿保留"
+                    % (used, reason))
+            if not self.q.finish_outbound(task["id"], "hold", note, bump_attempt=False,
+                                          retryable=0, failure_code=code or None,
+                                          expected="sending"):
+                log.info("任务已被撤回或结案，不再转待审核 #%d" % task["id"])
+                return {"status": "blocked", "reason": "任务已撤回或结案", "segment": index}
+            log.warning("发送未提交 #%d [%s]：%s" % (task["id"], task["chat"], note))
+            return {"status": "hold", "reason": note, "segment": index}
+        base = float(send_cfg.get("retry_delay", 45) or 45)
+        ceiling = float(send_cfg.get("retry_max_delay", 600) or 0)
+        delay = base * (2 ** min(used, 6))
+        if ceiling > 0:
+            delay = min(ceiling, delay)
+        self.q.requeue_outbound(task["id"], delay=delay, note=reason,
+                                count_attempt=counted)
+        log.info("发送未提交 #%d [%s]，%.0f 秒后重试（第 %d 次）：%s"
+                 % (task["id"], task["chat"], delay, used + (1 if counted else 0), reason))
+        return {"status": "draft", "reason": reason, "segment": index,
+                "retry_in": delay}
 
     def send_task(self, task: dict, sleep_delay: bool = True,
                   reload_cfg: bool = True) -> dict:
@@ -1059,21 +1453,60 @@ class Worker:
         block = self._send_block(task)
         if block:
             return self._apply_send_block(task, block)
+        if (task.get("kind") or "") == "relay_clarify":
+            # 过了门禁再润色：代传关着的时候，不该为一句根本发不出去的话
+            # 花一次模型调用、还占着发送线程。
+            try:
+                task = relay_mod.polish_clarify_task(self.q, self.cfg, task)
+            except Exception as e:
+                log.warning("追问措辞改写失败 #%s：%s: %s"
+                            % (task.get("id"), type(e).__name__, e))
+            else:
+                if task.get("text") != current.get("text"):
+                    # 改写同时改了正文和 ask，改写后按新正文再核一次门禁
+                    block = self._send_block(task)
+                    if block:
+                        return self._apply_send_block(task, block)
         if DRY:
             self.q.finish_outbound(task["id"], "cancelled", "dry-run", bump_attempt=False)
             return {"status": "dry-run"}
         chat = task["chat"]
         kind = task.get("kind") or "reply"
-        if sleep_delay and kind != "reminder":
+        if sleep_delay and kind not in ("reminder", "reminder_clarify", "relay_clarify"):
             _stop.wait(self.brain.human_delay(chat))
+
+        # 到点提醒的措辞必须由模型现写：准点由调度线程保证，这里多一点延迟
+        # 换一句像人说的话。模型没写出来就退回待发重试，**绝不拿系统模板
+        # 顶替**——模板只当占位，过期未发出会明确记成「错过」。
+        if kind == "reminder":
+            try:
+                task = reminder_mod.polish_task(self.q, self.cfg, self.brain, task)
+            except Exception as e:
+                log.warning("提醒措辞润色失败 #%s：%s: %s"
+                            % (task.get("id"), type(e).__name__, e))
+            source = (task.get("text_source") or "")
+            if source not in ("model", "manual", "legacy"):
+                used = int(task.get("attempts") or 0)
+                limit = int((self.cfg.get("send") or {}).get(
+                    "reminder_text_attempts", 4) or 4)
+                if used >= limit:
+                    self.q.mark_missed(task["id"], "模型一直没写出提醒正文，判定错过")
+                    log.warning("提醒正文生成失败，判定错过 #%d [%s]"
+                                % (task["id"], chat))
+                    return {"status": "missed", "reason": "提醒正文生成失败"}
+                self.q.requeue_outbound(task["id"], delay=15,
+                                        note="等模型写提醒正文", count_attempt=True)
+                log.info("提醒正文未就绪，15 秒后重试 #%d [%s]" % (task["id"], chat))
+                return {"status": "waiting_model", "reason": "提醒正文还没写好"}
 
         segs = segments_of(task)
         start = int(task.get("segments_sent") or 0)
         if kind == "reply" and start == 0 and self._presend_supplement(task, chat) == "superseded":
             return {"status": "superseded"}
-        if not segs:
+        if not any(segs):
             return self._apply_send_block(task, ("cancelled", "草稿内容为空"))
 
+        sent_seq = None
         for index in range(start, len(segs)):
             if reload_cfg:
                 self.cfg = self._load_bound_cfg()
@@ -1082,7 +1515,8 @@ class Worker:
                 return self._apply_send_block(task, block)
             seg = segs[index]
             if not seg:
-                self.q.bump_segments(task["id"], index + 1)
+                self.q.bump_segments(task["id"], index + 1, complete=index + 1 == len(segs),
+                                     sent_after_seq=sent_seq, expected="sending")
                 continue
 
             started = int(time.time())
@@ -1111,20 +1545,10 @@ class Worker:
                 status = response.get("outbound_status")
                 if status in ("cancelled", "expired", "hold"):
                     return self._apply_send_block(task, (status, reason))
-                code = response.get("reason")
-                count_attempt = code == "session_list_unavailable"
-                attempts_left = int(task.get("attempts") or 0) + 1 < OUTBOUND_MAX_ATTEMPTS
-                if response.get("retryable") and (not count_attempt or attempts_left):
-                    self.q.requeue_outbound(task["id"],
-                                            delay=float(send_cfg.get("retry_delay", 45)),
-                                            note=reason, count_attempt=count_attempt)
-                    if code == "main_in_tray" and task.get("error") != reason:
-                        log.info("出站 #%d 暂缓：%s" % (task["id"], reason))
-                    return {"status": "draft", "reason": reason, "segment": index}
-                self.q.finish_outbound(task["id"], "failed", reason, retryable=0,
-                                       failure_code=code if isinstance(code, str) else None)
-                log.warning("发送前拒绝 #%d：%s" % (task["id"], reason))
-                return {"status": "failed", "reason": reason, "segment": index}
+                # 没提交 = 一个字符都没发出去，重试绝对安全。不再按 retryable
+                # 白名单决定「失败还是重试」，统一走退避软重试，到上限转 hold。
+                return self._retry_unsubmitted(task, reason, index,
+                                               str(response.get("reason") or ""))
             if not (response.get("ok") and response.get("verified")):
                 self.q.mark_uncertain(task["id"], reason)
                 log.warning("发送待核实 #%d 第 %d 段：%s" % (task["id"], index + 1, reason))
@@ -1132,7 +1556,13 @@ class Worker:
 
             self.q.confirm_robot_sent(intent, ts=started)
             self._remember_sent_segment(task, index, seg)
-            self.q.bump_segments(task["id"], index + 1)
+            complete = index + 1 == len(segs)
+            sent_seq = response.get("verified_seq")
+            if not self.q.bump_segments(task["id"], index + 1, complete=complete,
+                                        sent_after_seq=sent_seq, expected="sending"):
+                return {"status": "blocked", "reason": "该任务已结案"}
+            if complete and kind == "reminder":
+                self._capture_relay_batch(chat)
             log.info("回读已确认 #%d 第 %d/%d 段 [%s]" %
                      (task["id"], index + 1, len(segs), chat))
             if index + 1 < len(segs) and sleep_delay:
@@ -1140,7 +1570,9 @@ class Worker:
                 hi = float(send_cfg.get("max_bubble_gap", 1.5))
                 _stop.wait(random.uniform(lo, max(lo, hi)))
 
-        self.q.finish_outbound(task["id"], "sent", verified=1, retryable=0)
+        if start >= len(segs):
+            self.q.finish_outbound(task["id"], "sent", verified=1, retryable=0,
+                                   expected="sending")
         allowed, _ = gate_mod.identity_ok(self.cfg, chat, at_me=bool(task.get("at_me")))
         if allowed:
             try:
@@ -1164,22 +1596,29 @@ class Worker:
             return
         segs = segments_of(task)
         index = int(task.get("segments_sent") or 0)
+        if segs and index == len(segs):
+            self.q.settle_uncertain(task["id"], status="sent", note="各段均已核实")
+            return
+        if not task.get("attempt_dispatched") and index < len(segs):
+            delay = int((self.cfg.get("send") or {}).get("retry_delay", 45))
+            self.q.settle_uncertain(task["id"], status="draft", delay=delay,
+                                    note="服务尚未取走该段，可安全重试")
+            return
         started = task.get("attempt_started_ts")
         after_seq = task.get("attempt_after_seq")
         if started is None or after_seq is None or index >= len(segs):
             self.q.settle_uncertain(task["id"], status="unverified",
                                     note="缺少该段的提交凭据，请人工核对")
             return
-        if not task.get("attempt_dispatched"):
-            delay = int((self.cfg.get("send") or {}).get("retry_delay", 45))
-            self.q.settle_uncertain(task["id"], status="draft", delay=delay,
-                                    note="服务尚未取走该段，可安全重试")
-            return
-        if self._verify_sent(task["chat"], segs[index], started, after_seq):
+        sent_seq = self._verify_sent(task["chat"], segs[index], started, after_seq)
+        if sent_seq:
             status = "sent" if index + 1 == len(segs) else "draft"
             note = "回读确认已发出" if status == "sent" else "已核实当前段，待发送其余段"
-            if self.q.settle_uncertain(task["id"], status=status, note=note, segments_sent=index + 1):
+            if self.q.settle_uncertain(task["id"], status=status, note=note,
+                                       segments_sent=index + 1, sent_after_seq=sent_seq):
                 self._remember_sent_segment(task, index, segs[index])
+                if status == "sent" and task.get("kind") == "reminder":
+                    self._capture_relay_batch(task["chat"])
                 log.info("对账 #%d：第 %d 段已核实" % (task["id"], index + 1))
         elif now - started > max(600.0, timeout * 4):
             if self.q.settle_uncertain(task["id"], status="unverified",

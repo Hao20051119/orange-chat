@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -37,7 +38,7 @@ class FakeDB:
 class FakeBrain:
     def __init__(self, queue):
         self.queue = queue
-        self.mem = support.make_memory("memory_%d.db" % id(self))
+        self.mem = support.make_memory("memory_for_" + Path(queue.db_path).name)
         self.cfg = {}
         self.calls = []
         self.followup = None
@@ -109,6 +110,30 @@ with patch.object(worker, "load_cfg", return_value=w.cfg):
 check("六条连发都进入同一轮模型", all("第%d句" % seq in w.brain.calls[0] for seq in range(1, 7)))
 check("带问号的短句和数字选项不省略", all(not worker.is_trivial_text(t) for t in ("在？", "可以?", "1")))
 
+section("代问目标在回复生成期间补发图片也会被收集")
+w = setup("relay_supplement", support.base_cfg(
+    proactive={"reminders": {"enabled": True}, "relay": {"enabled": False}},
+    media={"vision": {"content_desc": False}}))
+watch_id = w.q.add_relay_watch(ACCOUNT, "wxid_requester", CHAT, "饭吃完了？",
+                               asked_ts=int(time.time()) - 2)
+receive(w.q, 1, "到家了")
+
+def relay_followup(call):
+    if call == 1:
+        w.q.enqueue_inbound(ACCOUNT, CHAT, 2, int(time.time()), "图片", "[图片]", sort_seq=2)
+
+
+w.brain.followup = relay_followup
+with patch.object(worker, "load_cfg", return_value=w.cfg), \
+        patch.object(worker.media, "resolve_for_message", return_value=None):
+    w.process(CHAT)
+    w._capture_relay_batch(CHAT)
+watch = w.q.relay_watch_for(ACCOUNT, CHAT)
+items = json.loads(watch["reply_text"])
+check("首条文字和补发图各仅收一次",
+      watch["id"] == watch_id and watch["msg_count"] == 2 and
+      items[0] == "到家了" and items[1].get("local_id") == "2", str(items))
+
 section("采集入队报错，无论后续消息多少都不能跳过水位")
 w = setup("collector")
 w.q.set_collect_watermark(ACCOUNT, CHAT, 10)
@@ -131,7 +156,10 @@ check("恢复后保存水位", w.q.get_collect_watermark(ACCOUNT, CHAT) == 12)
 section("发送回读失败只对账当前段，不写未回读段进记忆")
 w = setup("delivery")
 now = int(time.time())
-w.db.rows = [{"sender_username": SELF, "content": "第二段", "create_time": now, "sort_seq": 21}]
+# 旧消息的 create_time 必须明显早于发送时刻，否则同一秒内会被当成刚发的
+# 那段「回读到了」（_verify_sent 用 create_time >= started 判新消息）。
+w.db.rows = [{"sender_username": SELF, "content": "第二段", "create_time": now - 60,
+              "sort_seq": 21}]
 task_id = w.q.create_outbound(ACCOUNT, CHAT, "第一段第二段", segments=["第一段", "第二段"])
 sent = []
 
@@ -151,7 +179,7 @@ check("记忆里只有确认送达的第一段", w.brain.mem.count(CHAT) == 1)
 check("对账先忽略提交水位之前同文旧消息", current["attempt_after_seq"] == 21)
 w._reconcile_task(current, now + 2, 8)
 check("旧消息不能补成发送成功", w.q.get_outbound(task_id)["status"] == "uncertain")
-w.db.rows.append({"sender_username": SELF, "content": "第二段", "create_time": now + 2, "sort_seq": 22})
+w.db.rows.append({"sender_username": SELF, "content": "第二段", "create_time": now + 120, "sort_seq": 22})
 w._reconcile_task(current, now + 3, 8)
 current = w.q.get_outbound(task_id)
 check("回读到新消息才结案", current["status"] == "sent" and current["segments_sent"] == 2)
@@ -172,6 +200,43 @@ def operator_cancel(*args):
 with patch.object(w, "_verify_sent", side_effect=operator_cancel):
     w._reconcile_task(w.q.get_outbound(race), now + 4, 8)
 check("对账不覆盖同步发生的人工操作", w.q.get_outbound(race)["status"] == "cancelled")
+
+section("中断恢复保留已核实段，只续发确定未提交的段")
+for sent_count in (0, 1, 2):
+    w = setup("recover_%d" % sent_count)
+    task_id = w.q.create_outbound(ACCOUNT, CHAT, "第一段第二段", segments=["第一段", "第二段"])
+    w.q.next_outbound(account=ACCOUNT)
+    if sent_count:
+        w.q.bump_segments(task_id, sent_count)
+    if sent_count == 1:
+        w.q.begin_outbound_attempt(task_id, 1, 21, now)
+    w.q.recover_inflight(age=0, account=ACCOUNT)
+    w._reconcile_task(w.q.get_outbound(task_id), now, 8)
+    task = w.q.get_outbound(task_id)
+    expected = "sent" if sent_count == 2 else "draft"
+    check("已核实 %d 段时恢复为 %s" % (sent_count, expected),
+          task["status"] == expected and task["segments_sent"] == sent_count)
+    if expected == "draft":
+        w.q.reset_not_before(task_id)
+        with patch.object(worker, "post", return_value={"ok": True, "verified": True}) as sender:
+            result = w.send_task(w.q.next_outbound(account=ACCOUNT), sleep_delay=False, reload_cfg=False)
+        texts = [call.args[1]["text"] for call in sender.call_args_list]
+        check("只续发剩余未提交的段", result["status"] == "sent" and
+              texts == ["第一段", "第二段"][sent_count:])
+
+section("启动清理上个进程的会话锁并保留手动暂停")
+w = setup("restart_locks")
+w.q.acquire_chat(CHAT, ttl=300)
+w.q.pause_chat(CHAT)
+db = SimpleNamespace(account=ACCOUNT, wxid=SELF, get_self_info=lambda: {"username": SELF})
+w.brain.agent = w.cfg["agent"]
+with patch.object(worker, "load_cfg", return_value=w.cfg), \
+        patch.object(worker, "open_bound_db", return_value=db), \
+        patch.object(worker, "Queue", return_value=w.q), \
+        patch.object(worker, "Brain", return_value=w.brain):
+    started = worker.Worker()
+check("已清理上次锁", started.q.acquire_chat(CHAT))
+check("人工设置的暂停继续生效", started.q.is_paused(CHAT))
 
 section("取消到点提醒及会话变化使待发送的主动消息失效")
 cfg = support.base_cfg(proactive={"enabled": True, "whitelist": [CHAT], "active_hours": [0, 0],
@@ -226,5 +291,40 @@ with (patch.object(worker, "_stop", fake_stop),
       patch.object(kb, "process_jobs", return_value={}) as process):
     w.run_kb_inbox()
     check("只在知识库开启期间处理文件", scan.call_count == process.call_count == 1)
+
+section("生成期间补发的代传话也要办")
+w = setup("relay_merge")
+w.cfg["proactive"] = {"enabled": True,
+                      "reminders": {"enabled": True},
+                      "relay": {"enabled": True, "delay_seconds": 0}}
+RELS = [{"name": "alex", "nickname": "alex", "relation": "你的哥哥",
+         "chat": "wxid_owner"},
+        {"name": "小王", "nickname": "老王", "relation": "朋友", "chat": CHAT}]
+receive(w.q, 1, "在吗")
+w.brain.followup = (lambda call: receive(w.q, 2, "帮我提醒alex，他明天要开会")
+                    if call == 1 else None)
+VERDICT = {"is_relay": True, "target": "alex", "candidates": [],
+           "need_target": False, "content": "明天要开会", "confidence": 0.9,
+           "tz": "", "reason": ""}
+with (patch.object(worker, "load_cfg", return_value=w.cfg),
+      patch.object(worker.relay_mod, "judge", return_value=VERDICT),
+      patch.object(worker.relay_mod, "_relations", return_value=RELS)):
+    w.process(CHAT)
+check("补发的那句建了代传话",
+      len(w.q.list_reminders("wxid_owner", account=ACCOUNT)) == 1,
+      str([r["content"] for r in w.q.list_reminders("wxid_owner", account=ACCOUNT)]))
+
+section("收件人解析失败时，普通回复直接使用实际未发送回执")
+w = setup("relay_refusal", cfg=w.cfg)
+receive(w.q, 1, "帮我问问陌生人晚上好")
+wrong_alias = {**VERDICT, "target": "alex（其他人）"}
+with (patch.object(worker, "load_cfg", return_value=w.cfg),
+      patch.object(worker.relay_mod, "judge", return_value=wrong_alias),
+      patch.object(worker.relay_mod, "_relations", return_value=RELS)):
+    w.process(CHAT)
+reply = w.q.list_outbound("draft", account=ACCOUNT)
+check("发送前拒绝只确认未发送，没有委托出站",
+      len(reply) == 1 and "没有发送" in reply[0]["text"]
+      and not w.q.list_reminders(account=ACCOUNT) and not w.brain.calls, reply)
 
 sys.exit(support.finish())

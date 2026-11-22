@@ -31,7 +31,12 @@ with patch.object(engine, "_wechat_windows", windows):
     with patch.object(engine.psutil, "process_iter", return_value=[process(1, selected, similar)]):
         check("进程同时打开两个账号库时拒绝", engine.active_account_binding(account, str(selected)) is None)
     with patch.object(engine.psutil, "process_iter", return_value=[process(1, selected), process(2, selected)]):
-        check("同账号出现两个候选主窗口时拒绝", engine.active_account_binding(account, str(selected)) is None)
+        try:
+            engine.active_account_binding(account, str(selected))
+            ambiguous = False
+        except engine.AccountBindingAmbiguous:
+            ambiguous = True
+        check("同账号出现两个候选主窗口时明确拒绝（抛歧义异常）", ambiguous)
     with patch.object(engine.psutil, "process_iter", return_value=[process(1, selected), process(2, similar)]):
         check("唯一小号实例得到匹配", engine.active_account_binding(account, str(selected)) == (1, 11))
 
@@ -75,6 +80,8 @@ def try_opening(root_for_mode, tables, *, minimized=False, visible=True, close_d
     manager._session_list = lambda deadline=None: ("table" if tree_ok() else None)
     manager._main_ready = lambda: manager._window_shown() and tree_ok()
     manager._park_main_window = Mock()
+    # 滚动/搜索兜底另有专门用例（test_send_resilience.py），这里只测「读不到行」的报错
+    manager._recover_session_row = Mock(return_value=None)
 
     def show(hwnd, mode):
         state.iconic = False
@@ -154,9 +161,9 @@ check("已显示的主窗若始终没有列表，只报告可重试错误",
       and result.opened is None and not result.posted)
 
 result = try_opening(lambda mode, main: main, lambda *args, **kwargs: missing)
-check("能读取列表但找不到目标，提示在微信打开会话且不自动重试",
+check("能读取列表但找不到目标，提示在微信打开会话且可稍后重试",
       result.result["reason"] == "no_row" and "打开该会话" in result.result["error"]
-      and not result.result["retryable"] and not result.modes and result.opened is None)
+      and result.result["retryable"] and not result.modes and result.opened is None)
 
 result = try_opening(lambda mode, main: main, lambda *args, **kwargs: duplicate)
 check("重名会话不恢复、不打开、不投递",
@@ -233,11 +240,14 @@ with (patch.object(engine, "WeChatUIA", return_value=chat_uia) as constructor,
           opened == 123 and constructor.call_args.kwargs["hwnd"] == 123
           and user32.SetWindowPos.call_args.args[0] == 123 and not user32.ShowWindow.called)
     user32.reset_mock()
+    manager._show_from_tray = Mock(return_value=False)   # 别在测试里真去点托盘图标
     chat_window.AutomationId = "ChatSingleWindowwxid_wrong"
     opened = manager.open_chat("测试会话", username="wxid_right")
-    check("主窗隐藏时同名独立窗若账号 ID 不符合也不复用",
-          opened is None and manager.last_open_error[0] == "ambiguous_target"
+    check("同名独立窗身份明确不符时先尝试重新打开，叫不出主窗就报可重试",
+          opened is None and manager.last_open_error[0] in ("main_in_tray", "no_window")
           and not user32.SetWindowPos.called and not user32.ShowWindow.called)
+    check("身份不符的窗口不会被当成发送目标",
+          manager.chat_windows.get("测试会话") is None)
 
 
 section("共享队列按账号领任务和提交")

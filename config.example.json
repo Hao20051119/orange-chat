@@ -5,7 +5,7 @@
   "llm": {
     "base_url": "https://api.deepseek.com",
     "api_key": "",
-    "model": "deepseek-chat",
+    "model": "deepseek-flash",
     "temperature": 1.0,
     "max_tokens": 800,
     "max_tokens_cap": 1200,
@@ -34,12 +34,20 @@
     "group_followup_minutes": 5,
     "group_analysis": true,
     "group_member_memory": true,
+    "group_context": {
+      "window": 10,
+      "minutes": 30,
+      "chars": 700
+    },
     "comprehend_prepass": true,
     "skip_system_accounts": true,
     "system_accounts": [],
-    "system_account_prefixes": ["gh_"],
+    "system_account_prefixes": [
+      "gh_"
+    ],
     "llm_decide": true,
     "skip_token": "[[SKIP]]",
+    "owner_wxid": "",
     "min_delay": 3,
     "max_delay": 12
   },
@@ -54,7 +62,9 @@
     "max_bubble_gap": 1.5,
     "max_draft_age": 300,
     "verify_seconds": 8,
-    "retry_delay": 45
+    "retry_delay": 45,
+    "retry_max_delay": 600,
+    "clear_input_draft": false
   },
   "memory": {
     "enabled": true,
@@ -70,7 +80,15 @@
     "voice_asr": {
       "enabled": false,
       "model_dir": ""
-    }
+    },
+    "vision": {
+      "show_images": true,
+      "max_images_per_turn": 4,
+      "max_bytes": 6291456,
+      "content_desc": true,
+      "content_desc_chars": 240
+    },
+    "ffmpeg": ""
   },
   "merge": {
     "quiet_seconds": 3.5,
@@ -137,7 +155,10 @@
     "idle_max_minutes": 360,
     "quiet_minutes_after_user": 20,
     "min_gap_after_self": 90,
-    "active_hours": [9, 23],
+    "active_hours": [
+      9,
+      23
+    ],
     "per_chat_daily": 3,
     "min_per_chat_daily": 0,
     "global_daily": 0,
@@ -153,7 +174,17 @@
       "grace_seconds": 7200,
       "short_grace_seconds": 60,
       "max_catchup_per_chat": 1,
-      "ask_at_fire": true
+      "ask_at_fire": true,
+      "llm_text": true,
+      "llm_timeout": 10,
+      "confirm_with_images": true,
+      "clarify_max_asks": 3
+    },
+    "relay": {
+      "enabled": true,
+      "delay_seconds": 4,
+      "daily_limit": 8,
+      "polish": true
     }
   },
   "contacts": {},

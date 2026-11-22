@@ -145,7 +145,12 @@ def evaluate(cfg: dict, chat: str, *, from_me: bool = False,
 
     now = _t.time() if now is None else float(now)
 
-    if kind == "reminder":
+    if kind == "relay_clarify":
+        if not is_private_chat(chat, _agent(cfg)):
+            return {"action": "cancel", "reason": "代传话只在真人私聊确认"}
+        if not (_proactive_cfg(cfg).get("relay") or {}).get("enabled", True):
+            return {"action": "cancel", "reason": "代传话未开启"}
+    if kind in ("reminder", "reminder_clarify", "relay_clarify"):
         return evaluate_reminder(cfg, chat, paused=paused, approved=approved)
     if kind == "proactive":
         return evaluate_proactive(cfg, chat, paused=paused, now=now, approved=approved)
@@ -180,6 +185,23 @@ def _proactive_cfg(cfg: dict) -> dict:
 
 def _reminders_cfg(cfg: dict) -> dict:
     return _proactive_cfg(cfg).get("reminders") or {}
+
+
+def reminder_entry_ok(cfg: dict, chat: str) -> tuple[bool, str]:
+    """提醒/代传话的入口门禁：只认提醒开关、系统号、黑名单。
+
+    刻意**不看** ``auto_reply``——关自动回复只是不聊天，用户显式委托的提醒
+    还得记下来。入口和 ``evaluate_reminder``（发送侧）用同一套标准，两端一致，
+    不会出现「收下了却发不出去」。
+    """
+    agent = _agent(cfg)
+    if not _reminders_cfg(cfg).get("enabled", False):
+        return False, "提醒功能未开启"
+    if is_system_chat(chat, agent):
+        return False, "系统/公众号账号，不收提醒委托"
+    if chat in (agent.get("reply_blacklist") or []):
+        return False, "在黑名单"
+    return True, ""
 
 
 def evaluate_reminder(cfg: dict, chat: str, *, paused: bool = False,

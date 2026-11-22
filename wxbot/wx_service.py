@@ -75,6 +75,7 @@ except Exception:                                         # pragma: no cover
 
 DEFAULT_PORT = 8765
 LOG_PATH = os.environ.get("WXBOT_LOG") or os.path.join(ROOT, "reply.log")
+CLARIFY_KINDS = ("reminder_clarify", "relay_clarify")
 
 # 允许通过 /config 修改的字段（白名单，避免被覆盖成半个配置）
 PATCHABLE = {
@@ -113,6 +114,32 @@ def _set_path(cfg: dict, path: str, value):
             node[p] = nxt
         node = nxt
     node[parts[-1]] = value
+
+
+def _clarify_send_block_reason(queue, task: dict) -> str | None:
+    if task["kind"] == "relay_clarify":
+        from relay import clarify_send_block_reason
+    else:
+        from reminder import clarify_send_block_reason
+    return clarify_send_block_reason(queue, task)
+
+
+def local_weekday_rule(inst, account: str, chat: str, rule: str, ts: int) -> str:
+    """控制台手工建单：把 ``weekly:N`` 的 N 换成**联系人当地**的星期。
+
+    ``ts`` 是主人本机时间；调度器（``reminder_parse.advance``）按联系人时差
+    推进，两边必须用同一个星期口径，否则「每周一」会在第二次触发时漂一天。
+    """
+    if not str(rule or "").startswith("weekly:"):
+        return rule
+    try:
+        tz = int(inst.get_chat_tz(account, chat) or 0)
+    except Exception:
+        return rule
+    if not tz:
+        return rule
+    from datetime import datetime as _dt
+    return "weekly:%d" % _dt.fromtimestamp(int(ts) + tz).isoweekday()
 
 
 class Service:
@@ -191,19 +218,25 @@ class Service:
     # ------------------------------------------------------------ 目标解析
     def resolve_target(self, chat: str, strict: bool = False,
                        allow_group: bool = False) -> dict:
-        """解析唯一的微信会话，发送时另外核验窗口自身的会话 ID。"""
+        """解析唯一的微信会话，发送时另外核验窗口自身的会话 ID。
+
+        失败时带 ``retryable``：联系人库/数据库暂时读不到属于瞬态（keepalive
+        会重绑），重名这种是硬歧义，绝不自动重试。
+        """
         chat = (chat or "").strip()
         if not chat:
-            return {"ok": False, "error": "缺少会话"}
+            return {"ok": False, "error": "缺少会话", "retryable": False}
         if self.db is None:
-            return {"ok": False, "error": "数据库不可用：%s" % (self.db_error or "未知")}
+            return {"ok": False, "error": "数据库不可用：%s" % (self.db_error or "未知"),
+                    "retryable": True}
 
         try:
             names = self.db.nickname_map(refresh=True)
             if chat in names:
                 username = chat
             elif strict:
-                return {"ok": False, "error": "联系人库无法核验选定的会话 ID"}
+                return {"ok": False, "error": "联系人库无法核验选定的会话 ID",
+                        "retryable": True}
             else:
                 users = {username for username, display in names.items() if display == chat}
                 if not users:
@@ -212,25 +245,27 @@ class Service:
                              and chat in (h.get("remark"), h.get("nick_name"))}
                 if len(users) != 1:
                     error = "显示名重名，请从会话列表选定明确的联系人" if users else "找不到会话"
-                    return {"ok": False, "error": error}
+                    return {"ok": False, "error": error, "retryable": not users}
                 username = next(iter(users))
             if strict and username.endswith("@chatroom") and not allow_group:
-                return {"ok": False, "error": "提醒和主动聊天只支持私聊"}
+                return {"ok": False, "error": "提醒和主动聊天只支持私聊", "retryable": False}
             display = names.get(username)
             if username.endswith("@chatroom"):
                 display = self.db.group_id_to_name(username) or display
             if not display or display == username:
-                return {"ok": False, "error": "无法核验选定会话的显示名"}
+                return {"ok": False, "error": "无法核验选定会话的显示名", "retryable": True}
             if any(other != username and name == display for other, name in names.items()):
-                return {"ok": False, "error": "会话显示名重名，无法安全定位窗口"}
+                return {"ok": False, "error": "会话显示名重名，无法安全定位窗口",
+                        "retryable": False}
             return {"ok": True, "username": username, "display": display}
         except Exception:
-            return {"ok": False, "error": "联系人库不可用，无法核验发送目标"}
+            return {"ok": False, "error": "联系人库不可用，无法核验发送目标",
+                    "retryable": True}
 
     # ------------------------------------------------------------ 发送
-    def _verify(self, chat: str, text: str, after_seq: int, seconds: float) -> bool:
+    def _verify(self, chat: str, text: str, after_seq: int, seconds: float) -> int | None:
         if self.db is None:
-            return False
+            return None
         deadline = time.time() + max(1.0, seconds)
         while time.time() < deadline:
             try:
@@ -239,12 +274,13 @@ class Service:
                         continue
                     if (m.get("content") or "").strip() != (text or "").strip():
                         continue
-                    if int(m.get("sort_seq") or 0) > after_seq:
-                        return True
+                    seq = int(m.get("sort_seq") or 0)
+                    if seq > after_seq:
+                        return seq
             except Exception:
                 pass
             time.sleep(0.8)
-        return False
+        return None
 
     @staticmethod
     def _reject(reason: str, error: str, **extra) -> dict:
@@ -283,13 +319,18 @@ class Service:
             status = ("expired" if "过期" in reason else
                       "hold" if verdict["action"] == "hold" else "cancelled")
             return self._reject("gate_changed", reason, outbound_status=status)
-        if kind == "reminder":
+        if kind in CLARIFY_KINDS:
+            reason = _clarify_send_block_reason(queue, task)
+        elif kind == "reminder":
             from reminder import send_block_reason
+
+            reason = send_block_reason(queue, cfg, task)
         elif kind == "proactive":
             from proactive import send_block_reason
+
+            reason = send_block_reason(queue, cfg, task)
         else:
             return None
-        reason = send_block_reason(queue, cfg, task)
         if reason:
             return self._reject("gate_changed", reason, outbound_status=(
                 "expired" if "过期" in reason else "cancelled"))
@@ -304,7 +345,7 @@ class Service:
              after_seq: int | None = None) -> dict:
         """账号校验、窗口提交与回读在同一服务内串行。"""
         kind = "reply" if source == "bot" else source
-        if kind not in ("manual", "reply", "reminder", "proactive"):
+        if kind not in ("manual", "reply", "reminder", *CLARIFY_KINDS, "proactive"):
             return self._reject("bad_args", "未知发送来源")
         automated = kind != "manual"
         if not isinstance(chat, str) or not chat.strip() or not isinstance(text, str) or not text.strip():
@@ -322,7 +363,8 @@ class Service:
                 return self._reject("account_unavailable", "无法核验选定小号", retryable=True)
             target = self.resolve_target(chat, strict=automated, allow_group=kind == "reply")
             if not target["ok"]:
-                return self._reject("ambiguous_target", target["error"])
+                return self._reject("ambiguous_target", target["error"],
+                                    retryable=bool(target.get("retryable")))
             username, display = target["username"], target["display"]
             queue = WxQueue() if WxQueue is not None else None
             baseline = after_seq or 0
@@ -344,15 +386,25 @@ class Service:
             blocked = preflight(False)
             if blocked:
                 return blocked
+            # 输入框里已有草稿时默认不清空（可能是人手写的）；清空需显式开配置
+            try:
+                self.engine.clear_input_draft = bool(
+                    (C.load().get("send") or {}).get("clear_input_draft", False))
+            except Exception:
+                self.engine.clear_input_draft = False
             intent = queue.record_robot_intent(username, text) if queue and not automated else None
             res = self.engine.send(display, text, username=username, preflight=preflight)
             submitted = res.get("submitted")
+            verified_seq = None
             verified = False
             if submitted:
                 secs = float((C.load().get("send") or {}).get("verify_seconds", 8))
-                verified = self._verify(username, text, baseline, secs)
+                readback = self._verify(username, text, baseline, secs)
+                verified = bool(readback)
+                if type(readback) is int:
+                    verified_seq = readback
             res.update(account=self.account, requested=chat, username=username, resolved=display,
-                       after_seq=baseline, verified=verified)
+                       after_seq=baseline, verified=verified, verified_seq=verified_seq)
             if intent is not None:
                 if verified:
                     queue.confirm_robot_sent(intent)
@@ -387,6 +439,9 @@ class Service:
             "bound_pid": self.engine.pid,
             "main_hwnd": self.engine.main_hwnd,
             "chat_windows": dict(self.engine.chat_windows),
+            # 最近一次身份核验的结局：ok / unreadable / mismatch / not_ours / closed
+            "identity": getattr(self.engine, "last_identity_kind", ""),
+            "open_error": list(getattr(self.engine, "last_open_error", ()) or ()),
             "uptime": int(time.time() - self.started_at),
             "last_error": self.last_error,
             "last_error_ts": self.last_error_ts,
@@ -527,6 +582,8 @@ class Service:
                 return {"ok": False, "error": "草稿正文过长（最多 4000 字）"}
             if task["status"] not in ("hold", "failed", "uncertain", "unverified"):
                 return {"ok": False, "error": "该任务已处理或正在发送，不能再改正文"}
+            if task.get("kind") in CLARIFY_KINDS and text.strip() != task["text"].strip():
+                return {"ok": False, "error": "核对问句须与待确认记录一致，正文不可修改"}
             if task.get("segments_sent") and text.strip() != task["text"]:
                 return {"ok": False, "error": "此消息有已发送的分段，不能修改正文"}
             if action != "approve":
@@ -539,6 +596,15 @@ class Service:
         elif action == "update":
             return {"ok": False, "error": "缺少正文"}
         if action == "approve":
+            if task.get("kind") in CLARIFY_KINDS:
+                from gate import evaluate
+
+                verdict = evaluate(C.load(), task["chat"], paused=inst.is_paused(task["chat"]),
+                                   kind=task["kind"], approved=True)
+                reason = (verdict["reason"] if verdict["action"] != "ok" else
+                          _clarify_send_block_reason(inst, task))
+                if reason:
+                    return {"ok": False, "error": reason}
             if not inst.approve_outbound(task["id"], self.account, text=text):
                 log.warning("人工批准 #%d 失败：状态=%s，失败代码=%s，已发送段数=%s" % (
                     task["id"], task["status"], task.get("failure_code"), task.get("segments_sent"),
@@ -561,6 +627,8 @@ class Service:
             return ({"ok": True, "status": "cancelled"} if result
                     else {"ok": False, "error": "任务状态已变化，请刷新"})
         if action == "mark_sent":
+            if task.get("kind") == "relay_clarify":
+                return {"ok": False, "error": "代传话核对须经微信回读确认，无法人工标记已发送"}
             if not inst.operator_outbound_result(
                 task["id"], self.account, task["status"], "sent", "人工标记已发出",
             ):
@@ -1047,8 +1115,19 @@ class Handler(BaseHTTPRequestHandler):
                 target = SERVICE.resolve_target(chat, strict=True)
                 if not target["ok"]:
                     return self._json(target)
-                rid = WxQueue().add_reminder(SERVICE.account, target["username"], content[:60],
-                                             rule, ts, anchor_ts=ts)
+                inst = WxQueue()
+                # 控制台输入的是主人本机时间，调度器却按联系人当地时间推进。
+                # 星期必须用**联系人当地**重算：比主机快两小时的联系人，
+                # 主机「周一 23:00」在他那边是周二 01:00，用主机星期建单，
+                # 第二次触发就会漂回周日。
+                rule = local_weekday_rule(inst, SERVICE.account, target["username"],
+                                          rule, ts)
+                try:
+                    zone = inst.get_chat_zone(SERVICE.account, target["username"])
+                except Exception:
+                    zone = None
+                rid = inst.add_reminder(SERVICE.account, target["username"], content[:60],
+                                        rule, ts, anchor_ts=ts, tz_zone=zone)
                 log.info("手动建提醒 #%d [%s]：%s @ %s" % (
                     rid, chat, redact(content[:30]), at))
                 return self._json({"ok": True, "id": rid, "next_ts": ts})

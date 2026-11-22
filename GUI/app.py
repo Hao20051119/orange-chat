@@ -8,12 +8,13 @@ import re
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from urllib.parse import urlencode, urlsplit
 
-from runtime import OrangeRuntime
+from runtime import DEFAULT_MODEL, OrangeRuntime
 import ui as style
 from ui import (EntryField, GlassFrame, GlassText, GlassWell, Palette, PillButton,
                 PillCheck, PillSelect)
@@ -216,6 +217,87 @@ def chat_id(value):
     return value
 
 
+def fit_columns(spec, content, avail, *, head_measure, pad, floor):
+    """算出每列宽度：先要够（表头/内容 + 内边距），再按设计比例分富余。
+
+    ``spec`` 是 ``[(key, title, 设计宽度, 可拉伸)]``，``content`` 是每列内容
+    实测的最大像素宽。返回 ``(mins, widths)``。
+
+    纯函数，不碰 Tk：GUI 只是把测量函数传进来，测试可以直接调它。
+    """
+    base, mins, caps, weights = [], [], [], []
+    for index, (key, title, width, stretch) in enumerate(spec):
+        head_w = head_measure(title) + pad
+        body_w = (content[index] if index < len(content) else 0) + pad
+        min_w = int(max(floor, head_w))
+        want = int(max(min_w, body_w))
+        mins.append(min_w)
+        base.append(want)
+        # 封顶决定「富余能把它撑多胖」：可拉伸列最多翻倍；本来就宽的非拉伸
+        # 列给 60px；时间/状态/次数这类短列只给一点呼吸空间，别虚胖。
+        if stretch:
+            caps.append(int(max(want * 2, want + int(pad * 4))))
+        elif want > int(pad * 6.5):
+            caps.append(int(want + int(pad * 2)))
+        else:
+            caps.append(int(want + int(pad * 0.8)))
+        weights.append(max(int(width), int(pad * 2)))
+
+    total = sum(base)
+    if total < avail:
+        extra = avail - total
+        widths = list(base)
+        active = set(range(len(spec)))
+        while extra > 0 and active:
+            wsum = sum(weights[i] for i in active)
+            if wsum <= 0:
+                break
+            used = 0
+            for i in list(active):
+                share = extra * weights[i] // wsum
+                room = caps[i] - widths[i]
+                add = max(0, min(share, room))
+                widths[i] += add
+                used += add
+                if widths[i] >= caps[i]:
+                    active.discard(i)
+            if used <= 0:
+                break
+            extra -= used
+        if extra > 0:
+            # 都顶到封顶还有富余（大屏 + 内容短）：给内容最长的那列
+            flexible = [i for i, col in enumerate(spec) if col[3]] or list(range(len(spec)))
+            main = max(flexible,
+                       key=lambda i: (content[i] if i < len(content) else 0, weights[i]))
+            widths[main] += extra
+        return mins, widths
+    if total == avail:
+        return mins, base
+    # 放不下：从长列里按比例扣，扣到表头宽为止，还不够就靠横向滚动条
+    over = total - avail
+    shrinkable = [i for i in range(len(spec)) if base[i] > mins[i]]
+    while over > 0 and shrinkable:
+        room_total = sum(base[i] - mins[i] for i in shrinkable)
+        if room_total <= 0:
+            break
+        take = min(over, room_total)
+        cut_total = 0
+        for i in shrinkable:
+            room = base[i] - mins[i]
+            cut = min(room, int(take * room / room_total))
+            if cut:
+                base[i] -= cut
+                cut_total += cut
+        if cut_total <= 0:
+            # 取整把每一刀都磨成 0 时，至少从最宽的那列切 1px，避免死循环
+            biggest = max(shrinkable, key=lambda i: base[i] - mins[i])
+            base[biggest] -= 1
+            cut_total = 1
+        over -= cut_total
+        shrinkable = [i for i in shrinkable if base[i] > mins[i]]
+    return mins, base
+
+
 class OrangeApp:
     def __init__(self, root, runtime=None):
         self.root = root
@@ -244,6 +326,16 @@ class OrangeApp:
         # 账号检测到哪一步了：改窗口大小要重建页面，靠它决定重建后要不要重新扫。
         self._accounts_state = "idle"
         self.tables = {}
+        # 表格列宽自适应：定义表、内容宽缓存、横向滚动条、防抖任务
+        self.table_specs = {}
+        self.table_content = {}
+        self.table_scroll = {}
+        self._fit_jobs = {}
+        self._tip = None
+        # 量文字宽度用同款字体，避免列宽和数据实际显示差一截
+        self._table_head_font = tkfont.Font(root=root, family=FONT,
+                                            size=self._fs(9), weight="bold")
+        self._table_body_font = tkfont.Font(root=root, family=FONT, size=self._fs(10))
         self.nav = {}
         self._resize_job = None
         self.feedback = tk.StringVar()
@@ -506,39 +598,187 @@ class OrangeApp:
         return result
 
     def _table(self, parent, name, columns, *, height=8):
-        """表格外面套一层圆角外壳：不然整块白色区域是直角，和卡片圆角打架。"""
+        """表格外面套一层圆角外壳：不然整块白色区域是直角，和卡片圆角打架。
+
+        列宽不写死：``_fit_table`` 按表头和实际内容量文字宽度，短列收到内容宽、
+        长文本列吃剩余；窗口窄到放不下时给横向滚动条（悬停还能看完整内容）。
+        """
         shell = GlassWell(parent, PAL, radius=14)
         shell.pack(fill="both", expand=True)
         frame = ttk.Frame(shell)
         frame.pack(fill="both", expand=True, padx=self._s(11), pady=self._s(9))
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
         tree = ttk.Treeview(frame, columns=tuple(col[0] for col in columns),
                             show="headings", selectmode="browse", height=height)
         for key, title, width, stretch in columns:
             tree.heading(key, text=title, anchor="w")
-            tree.column(key, width=self._s(width), minwidth=self._s(min(width, 80)),
-                        stretch=stretch, anchor="w")
+            tree.column(key, width=self._s(width), minwidth=self._s(48),
+                        stretch=False, anchor="w")
         scroll = ttk.Scrollbar(frame, command=tree.yview)
-        tree.configure(yscrollcommand=scroll.set)
-        tree.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
+        hscroll = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=scroll.set, xscrollcommand=hscroll.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        hscroll.grid(row=1, column=0, sticky="ew")
+        hscroll.grid_remove()
         tree.tag_configure("stripe", background="#FDF8F1")
         self.tables[name] = (tree, {})
+        self.table_specs[name] = [(key, title, int(width), bool(stretch))
+                                  for key, title, width, stretch in columns]
+        self.table_scroll[name] = hscroll
+        self.table_content.pop(name, None)
+        tree.bind("<Configure>", lambda _e, n=name: self._schedule_fit(n), add="+")
+        tree.bind("<Motion>", lambda e, n=name: self._hover_tip(n, e), add="+")
+        tree.bind("<Leave>", lambda _e: self._hide_tip(), add="+")
+        self.root.after_idle(lambda: self._fit_table(name))
         return tree
+
+    # ------------------------------------------------------------ 列宽自适应
+    def _schedule_fit(self, name, delay=40):
+        """防抖：连续拖动窗口只算一次，避免每像素重排整张表。"""
+        job = self._fit_jobs.pop(name, None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except tk.TclError:
+                pass
+        self._fit_jobs[name] = self.root.after(delay, lambda: self._fit_table(name))
+
+    def _fit_table(self, name):
+        """按「表头 + 内容 + 设计比例」重排列宽。
+
+        旧逻辑：先按内容要够，剩下的**全塞给最长的那一列**——大屏上那一列
+        能空出四百像素，其他列却贴着内容边，看着又挤又空。
+
+        新逻辑见 ``fit_columns``：每列先要够，富余按设计比例分给所有列，
+        短列有小封顶；实在放不下才压缩 / 出横向滚动条。
+        """
+        self._fit_jobs.pop(name, None)
+        entry = self.tables.get(name)
+        spec = self.table_specs.get(name)
+        if not entry or not spec:
+            return
+        tree = entry[0]
+        try:
+            avail = tree.winfo_width() - self._s(3)
+        except tk.TclError:
+            return
+        if avail <= self._s(40):
+            self._schedule_fit(name, 80)
+            return
+
+        pad = self._s(30)                 # 单元格左右内边距 + 边框 + 呼吸空间
+        head = self._table_head_font
+        body = self._table_body_font
+        content = self.table_content.get(name) or [0] * len(spec)
+        mins, widths = fit_columns(spec, content, avail,
+                                   head_measure=head.measure,
+                                   pad=pad, floor=self._s(48))
+        for index, (key, _title, _width, _stretch) in enumerate(spec):
+            tree.column(key, width=max(mins[index], int(widths[index])),
+                        minwidth=mins[index], stretch=False, anchor="w")
+        hscroll = self.table_scroll.get(name)
+        if hscroll is not None:
+            if sum(max(mins[i], int(widths[i])) for i in range(len(spec))) > avail:
+                hscroll.grid()
+            else:
+                hscroll.grid_remove()
+
+    # ------------------------------------------------------------ 完整内容提示
+    def _hide_tip(self):
+        tip = getattr(self, "_tip", None)
+        if tip is not None:
+            try:
+                tip.destroy()
+            except tk.TclError:
+                pass
+            self._tip = None
+
+    def _show_tip(self, text, x, y):
+        tip = getattr(self, "_tip", None)
+        if tip is not None:
+            try:
+                label = tip._label
+                if label.cget("text") == text:
+                    tip.geometry("+%d+%d" % (x + 14, y + 18))
+                    return
+            except (AttributeError, tk.TclError):
+                self._hide_tip()
+            else:
+                self._hide_tip()
+        tip = tk.Toplevel(self.root)
+        tip.overrideredirect(True)
+        try:
+            tip.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        label = tk.Label(tip, text=text, justify="left", bg="#FFFDF8", fg=INK,
+                         font=(FONT, self._fs(10)), padx=self._s(8), pady=self._s(5),
+                         wraplength=self._s(420), bd=0, highlightthickness=1,
+                         highlightbackground="#E6D9C7")
+        label.pack()
+        tip._label = label
+        tip.geometry("+%d+%d" % (x + 14, y + 18))
+        self._tip = tip
+
+    def _hover_tip(self, name, event):
+        """单元格内容宽于列宽时，悬停显示完整文字。"""
+        entry = self.tables.get(name)
+        spec = self.table_specs.get(name)
+        if not entry or not spec:
+            return
+        tree = entry[0]
+        row = tree.identify_row(event.y)
+        col = tree.identify_column(event.x)
+        if not row or row == "__empty__" or not col:
+            self._hide_tip()
+            return
+        try:
+            index = int(col[1:]) - 1
+        except ValueError:
+            self._hide_tip()
+            return
+        if index < 0 or index >= len(spec):
+            self._hide_tip()
+            return
+        values = tree.item(row, "values")
+        if index >= len(values):
+            self._hide_tip()
+            return
+        text = str(values[index])
+        try:
+            width = int(tree.column(spec[index][0], "width"))
+        except (tk.TclError, ValueError):
+            self._hide_tip()
+            return
+        if not text or self._table_body_font.measure(text) + self._s(18) <= width:
+            self._hide_tip()
+            return
+        self._show_tip(text, event.x_root, event.y_root)
 
     def _fill(self, name, rows, key, values, *, empty="暂无记录"):
         tree, index = self.tables[name]
         selected = tree.selection()
         tree.delete(*tree.get_children())
         index.clear()
+        widths = [0] * len(self.table_specs.get(name) or [])
         for row in rows:
             row_id = str(key(row))
             if row_id in index:
                 continue
             index[row_id] = row
-            tree.insert("", "end", iid=row_id, values=values(row),
+            vals = values(row)
+            for i, value in enumerate(vals[:len(widths)]):
+                w = self._table_body_font.measure(str(value))
+                if w > widths[i]:
+                    widths[i] = w
+            tree.insert("", "end", iid=row_id, values=vals,
                         tags=("stripe",) if len(index) % 2 == 0 else ())
         if not rows:
             tree.insert("", "end", iid="__empty__", values=(empty,))
+        self.table_content[name] = widths
+        self._schedule_fit(name)
         if selected and selected[0] in index:
             tree.selection_set(selected)
 
@@ -554,6 +794,16 @@ class OrangeApp:
         for child in widget.winfo_children():
             child.destroy()
         self.tables.clear()
+        self.table_specs.clear()
+        self.table_content.clear()
+        self.table_scroll.clear()
+        for job in self._fit_jobs.values():
+            try:
+                self.root.after_cancel(job)
+            except tk.TclError:
+                pass
+        self._fit_jobs.clear()
+        self._hide_tip()
         self.view_version += 1
 
     def _entry(self, parent, var, *, show="", width=20):
@@ -645,7 +895,7 @@ class OrangeApp:
         self.model_fields = {
             "base_url": tk.StringVar(
                 value=fields.get("base_url") or "https://api.deepseek.com"),
-            "model": tk.StringVar(value=fields.get("model") or "deepseek-chat"),
+            "model": tk.StringVar(value=fields.get("model") or DEFAULT_MODEL),
             "api_key": tk.StringVar(value=fields.get("api_key") or ""),
         }
         # ---- 已保存的 Key 记录（api_keys.local.json，只在本机、可选用可删除）----
@@ -1578,6 +1828,9 @@ class OrangeApp:
         text = self.draft_text.get("1.0", "end-1c").strip()
         changed = text != (row.get("text") or "").strip()
         if action in ("approve", "update"):
+            if changed and row.get("kind") in ("reminder_clarify", "relay_clarify"):
+                self.feedback.set("提醒核对问句必须与排程一致，正文不可修改。")
+                return
             if not text:
                 self.feedback.set("草稿正文不能为空。")
                 return
@@ -1631,7 +1884,8 @@ class OrangeApp:
         self._button(bar, "新建提醒", self._new_reminder, primary=True).pack(side="right")
         bar.pack_configure(pady=(0, 8))
         self._table(card, "reminders", (("display", "收件人", 115, False),
-                    ("content", "提醒内容", 225, True), ("rule", "重复", 85, False),
+                    ("content", "提醒内容", 225, True), ("kind", "类别", 96, False),
+                    ("rule", "重复", 85, False),
                     ("next", "下次发送", 135, False), ("status", "状态", 92, False)), height=6)
         bar = self._row(card)
         bar.pack_configure(pady=(7, 0))
@@ -1670,9 +1924,18 @@ class OrangeApp:
                                   r["username"] for r in chats.get("chats", [])
                                   if r.get("private", is_private_chat(r.get("username")))}
         items = data.get("items") or []
+
+        def kind_of(row):
+            """这条是「代传话」还是自己的「提醒」；代传话带上谁托的。"""
+            if (row.get("confirm_mode") or "") == "relay":
+                who = (row.get("relay_from") or "").strip()
+                return ("代传话·%s" % who) if who else "代传话"
+            return "提醒"
+
         self._fill("reminders", items, lambda r: r["id"],
                    lambda r: (r.get("display") or r.get("chat"), clipped(r.get("content")),
-                              self._rule_label(r.get("rule")), clock(r.get("next_ts"), date=True),
+                              kind_of(r), self._rule_label(r.get("rule")),
+                              clock(r.get("next_ts"), date=True),
                               translated(r.get("status"))))
         titles = {r["id"]: r.get("content") for r in items}
         self._fill("occurrences", data.get("occurrences") or [], lambda r: r["id"],

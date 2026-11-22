@@ -262,11 +262,19 @@ def merge_knowledge(old_path: Path, new_path: Path, apply: bool) -> dict[str, di
     report: dict[str, dict] = {}
     try:
         dst.execute("BEGIN IMMEDIATE")
+        legacy_documents = set()
+        version = src.execute("PRAGMA user_version").fetchone()[0]
+        if version < 3 and "quarantined" in columns(dst, "kb_documents"):
+            legacy_documents.update((r["doc_id"], r["account"]) for r in src.execute(
+                "SELECT doc_id, account FROM kb_jobs WHERE doc_id IS NOT NULL "
+                "AND state='done' AND input_ref LIKE 'wxfile:%'"))
         for table in ("kb_documents", "kb_revisions", "kb_chunks", "kb_jobs"):
             inserted = skipped = 0
             cols_ = shared(src, dst, table)
             for row in src.execute("SELECT * FROM [%s]" % table):
                 data = {c: row[c] for c in cols_}
+                if table == "kb_documents" and (data["id"], data["account"]) in legacy_documents:
+                    data["quarantined"] = 1
                 if put(dst, table, data):
                     inserted += 1
                 else:

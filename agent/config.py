@@ -15,6 +15,7 @@ import os
 import threading
 import time
 from functools import wraps
+from urllib.parse import urlsplit
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(BASE)
@@ -22,6 +23,21 @@ CONFIG_PATH = os.environ.get("WXBOT_CONFIG") or os.path.join(ROOT, "config.json"
 
 ENV_KEY = "DSHWX_API_KEY"
 ENV_TOKEN = "DSHWX_TOKEN"
+DEFAULT_MODEL = "deepseek-flash"
+
+
+def is_deepseek_official(base_url: str) -> bool:
+    try:
+        return urlsplit(base_url).hostname == "api.deepseek.com"
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def model_id(base_url: str, name: str) -> str:
+    """Upgrade the retired default on the official endpoint only."""
+    if name == "deepseek-chat" and is_deepseek_official(base_url):
+        return DEFAULT_MODEL
+    return name
 
 _config_lock = threading.RLock()
 _state = {
@@ -51,7 +67,7 @@ def _defaults() -> dict:
         "llm": {
             "base_url": "https://api.deepseek.com",
             "api_key": "",
-            "model": "deepseek-chat",
+            "model": DEFAULT_MODEL,
             "temperature": 1.0,
             "max_tokens": 800,
             "max_tokens_cap": 1200,
@@ -79,8 +95,11 @@ def _defaults() -> dict:
             "system_account_prefixes": ["gh_"],
             "llm_decide": True,
             "skip_token": "[[SKIP]]",
+            "owner_wxid": "",              # 「提醒一下他」里的「他」是谁
             "min_delay": 1,
             "max_delay": 3,
+            # 群里没点名的最近几句当背景一起给模型（含图片），别接错话
+            "group_context": {"window": 10, "minutes": 30, "chars": 700},
         },
         "bot": {"max_parallel_chats": 2},
         "send": {"bubble": True, "bubble_max_chars": 60, "max_bubbles": 2,
@@ -90,7 +109,19 @@ def _defaults() -> dict:
                    "record_skipped": True, "ephemeral_ttl": 1800,
                    "adapt_every": 20, "history_msg_chars": 600,
                    "max_context_chars": 12000},
-        "media": {"voice_asr": {"enabled": False, "model_dir": ""}},
+        "media": {"voice_asr": {"enabled": False, "model_dir": ""},
+                  # 图片怎么给模型：默认真把图塞进去（聊天里发来的图很可能带信息），
+                  # 表情包仍然只要一句情绪描述，省钱也不跑偏。
+                  "vision": {
+                      "show_images": True,
+                      "max_images_per_turn": 4,
+                      "max_bytes": 6 * 1024 * 1024,   # 一轮图片 base64 总量
+                      "content_desc": True,           # 图片转成内容描述写进记忆
+                      "content_desc_chars": 240,
+                  },
+                  # .wxgf（H.265 动态表情）要用 ffmpeg 抽首帧，这里可以写死路径；
+                  # 留空就自动找：PATH → imageio-ffmpeg → tools\ffmpeg\
+                  "ffmpeg": ""},
         "merge": {"quiet_seconds": 3.5, "max_wait_seconds": 12.0,
                   "quiet_complete_seconds": 2.0, "quiet_incomplete_seconds": 5.0,
                   "quiet_media_seconds": 1.5, "absorb_after_seconds": 30,
@@ -152,7 +183,18 @@ def _defaults() -> dict:
                 "short_grace_seconds": 60,
                 "max_catchup_per_chat": 1,
                 "ask_at_fire": True,
+                # 到点那句话先让模型现写；模板只做兜底（超时/空回复/想跳过）
+                "llm_text": True,
+                "llm_timeout": 10,
+                # 判定时带了图（课表/日程截图）就先问一句核对，再建单
+                "confirm_with_images": True,
+                # 待确认最多追问几次；老是答非所问就放弃，别没完没了
+                "clarify_max_asks": 3,
             },
+            # 代传话：A 让你去提醒 B（「你提醒一下他该睡觉了」）
+            # polish：追问/回执这类程序文案，发之前让模型按人设说一遍（fail-open）
+            "relay": {"enabled": True, "delay_seconds": 4, "daily_limit": 8,
+                      "polish": True},
         },
     }
 
@@ -164,6 +206,9 @@ def _merge_defaults(cfg: dict) -> dict:
             d[k] = {**d[k], **v}
         else:
             d[k] = v
+    llm = d.get("llm")
+    if isinstance(llm, dict):
+        llm["model"] = model_id(llm.get("base_url"), llm.get("model"))
     return d
 
 
@@ -202,6 +247,15 @@ def _validate(cfg: dict) -> list[str]:
             for k in ("min_delay", "max_delay"):
                 if k in agent and not isinstance(agent[k], (int, float)):
                     problems.append("agent.%s 必须是数字" % k)
+            gc = agent.get("group_context")
+            if gc is not None and not isinstance(gc, dict):
+                problems.append("agent.group_context 必须是对象")
+            elif isinstance(gc, dict):
+                for k in ("window", "minutes", "chars"):
+                    v = gc.get(k)
+                    if v is not None and (isinstance(v, bool)
+                                          or not isinstance(v, (int, float)) or v < 0):
+                        problems.append("agent.group_context.%s 必须是非负数字" % k)
 
     for key in ("bot", "send", "memory", "merge", "takeover", "web", "logging",
                 "media", "stickers", "kb"):
@@ -210,6 +264,25 @@ def _validate(cfg: dict) -> list[str]:
             continue
         if not isinstance(v, dict):
             problems.append("%s 必须是对象" % key)
+
+    media = cfg.get("media")
+    if isinstance(media, dict):
+        vis = media.get("vision")
+        if vis is not None and not isinstance(vis, dict):
+            problems.append("media.vision 必须是对象")
+        elif isinstance(vis, dict):
+            for k in ("max_images_per_turn", "max_bytes", "content_desc_chars"):
+                v = vis.get(k)
+                if v is not None and (isinstance(v, bool)
+                                      or not isinstance(v, (int, float)) or v < 0):
+                    problems.append("media.vision.%s 必须是非负数字" % k)
+            if "show_images" in vis and not isinstance(vis["show_images"], bool):
+                problems.append("media.vision.show_images 必须是布尔")
+            if "content_desc" in vis and not isinstance(vis["content_desc"], bool):
+                problems.append("media.vision.content_desc 必须是布尔")
+        ff = media.get("ffmpeg")
+        if ff is not None and not isinstance(ff, str):
+            problems.append("media.ffmpeg 必须是字符串")
     for k, lo in (("max_parallel_chats", 1), ("bubble_max_chars", 8),
                   ("max_bubbles", 1), ("max_draft_age", 0)):
         v = (cfg.get("send") or {}).get(k)
@@ -286,6 +359,23 @@ def _validate(cfg: dict) -> list[str]:
                     v = rem.get(k)
                     if v is not None and (not isinstance(v, (int, float)) or v < 0):
                         problems.append("proactive.reminders.%s 必须是非负数字" % k)
+                if "llm_text" in rem and not isinstance(rem["llm_text"], bool):
+                    problems.append("proactive.reminders.llm_text 必须是布尔")
+                v = rem.get("llm_timeout")
+                if v is not None and (not isinstance(v, (int, float))
+                                      or not 3 <= v <= 120):
+                    problems.append("proactive.reminders.llm_timeout 必须在 3~120 秒之间")
+
+            relay = proactive.get("relay")
+            if relay is not None and not isinstance(relay, dict):
+                problems.append("proactive.relay 必须是对象")
+            elif isinstance(relay, dict):
+                if "enabled" in relay and not isinstance(relay["enabled"], bool):
+                    problems.append("proactive.relay.enabled 必须是布尔")
+                for k in ("delay_seconds", "daily_limit"):
+                    v = relay.get(k)
+                    if v is not None and (not isinstance(v, (int, float)) or v < 0):
+                        problems.append("proactive.relay.%s 必须是非负数字" % k)
 
     kb = cfg.get("kb")
     if isinstance(kb, dict):
